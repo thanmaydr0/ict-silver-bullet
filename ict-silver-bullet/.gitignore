@@ -1,0 +1,10 @@
+.env
+brain/.env
+executor/.env
+__pycache__/
+.venv/
+*.pyc
+logs/
+backtest/data/
+*.parquet
+.pytest_cache/

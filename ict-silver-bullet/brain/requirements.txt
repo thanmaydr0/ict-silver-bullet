@@ -1,0 +1,12 @@
+supabase
+python-dotenv
+pydantic>=2
+requests
+tzdata
+numpy
+pandas
+plotly
+gradio
+firecrawl-py
+anthropic
+openai

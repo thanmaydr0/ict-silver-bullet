@@ -1,0 +1,8 @@
+MetaTrader5
+supabase
+python-dotenv
+requests
+tzdata
+psutil
+numpy
+pandas
