@@ -6,6 +6,7 @@ MetaTrader5 and pandas are imported only when the CLI runs.
 
 import argparse
 from datetime import datetime, timedelta
+from io import BytesIO
 import logging
 from pathlib import Path
 import re
@@ -36,6 +37,7 @@ def _pull_pair(terminal, pair: str, timeframe: str, start: datetime,
     if interval is None:
         raise ValueError(f"Unsupported MT5 timeframe: {timeframe}")
     rows = {}
+    empty_chunks = 0
     cursor = start
     # NOTE: Historical bars use the same sampled/configured offset as the feeder.
     # Historical DST offsets cannot be reconstructed from the current tick alone;
@@ -57,8 +59,16 @@ def _pull_pair(terminal, pair: str, timeframe: str, start: datetime,
         logger.info("%s %s: %s to %s, %d bars", pair, timeframe,
                     cursor.isoformat(), chunk_end.isoformat(), added)
         if len(rates) == 0:
+            empty_chunks += 1
             logger.warning("No history for %s in this chunk; check broker history and MT5 Max bars setting", pair)
         cursor = chunk_end
+    if rows:
+        logger.info("%s %s: available coverage %s to %s (%d unique bars)",
+                    pair, timeframe, min(rows).isoformat(), max(rows).isoformat(), len(rows))
+    if empty_chunks:
+        logger.warning("%s %s: %d requested chunks returned no bars; export coverage may be partial. "
+                       "Check MT5 Max bars in chart and broker history availability.",
+                       pair, timeframe, empty_chunks)
     return [rows[ts] for ts in sorted(rows)]
 
 
@@ -75,8 +85,16 @@ def main() -> None:
         parser.error("--years must be between 1 and 100")
     timeframe = args.timeframe.upper()
 
-    import MetaTrader5 as mt5
     import pandas as pd
+    # Validate the actual pandas backend before connecting or collecting history.
+    try:
+        pd.DataFrame().to_parquet(BytesIO(), index=False)
+    except ImportError:
+        parser.error("Parquet support is missing or incompatible in this Python environment. "
+                     "Run: python -m pip install -r backtest/requirements.txt "
+                     "in the same activated environment, then retry.")
+
+    import MetaTrader5 as mt5
     from executor import mt5_bridge
     from executor.logging_setup import setup_logging
 

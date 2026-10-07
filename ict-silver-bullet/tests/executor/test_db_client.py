@@ -312,7 +312,10 @@ def test_history_main_parquet_export(terminal, monkeypatch, tmp_path):
     frame = MagicMock()
     frame.__getitem__.return_value = [SINCE]
     def save(path, index):
-        path.write_bytes(b"mock-parquet")
+        if hasattr(path, "write_bytes"):
+            path.write_bytes(b"mock-parquet")
+        else:
+            path.write(b"mock-parquet")
     frame.to_parquet.side_effect = save
     pandas = SimpleNamespace(DataFrame=MagicMock(return_value=frame), to_datetime=MagicMock(return_value=[SINCE]))
     monkeypatch.setitem(sys.modules, "pandas", pandas)
@@ -321,3 +324,31 @@ def test_history_main_parquet_export(terminal, monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
     pandas.to_datetime.assert_called_once_with([SINCE], utc=True)
     mt5.shutdown.assert_called_once()
+
+
+def test_history_missing_parquet_engine_fails_before_terminal(terminal, monkeypatch, tmp_path, capsys):
+    frame = MagicMock()
+    frame.to_parquet.side_effect = ImportError("No usable engine")
+    monkeypatch.setitem(sys.modules, "pandas", SimpleNamespace(DataFrame=MagicMock(return_value=frame)))
+    monkeypatch.setitem(sys.modules, "MetaTrader5", terminal[0])
+    monkeypatch.setattr(sys, "argv", ["pull_history"])
+    monkeypatch.setattr(history, "DATA_DIR", tmp_path / "data")
+    with pytest.raises(SystemExit) as error:
+        history.main()
+    assert error.value.code == 2
+    assert "python -m pip install -r backtest/requirements.txt" in capsys.readouterr().err
+    terminal[0].initialize.assert_not_called()
+    assert not history.DATA_DIR.exists()
+
+
+def test_history_partial_coverage_is_reported(terminal, caplog):
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    first_bar = datetime(2026, 2, 1, tzinfo=UTC)
+    end = datetime(2026, 2, 2, tzinfo=UTC)
+    terminal[0].copy_rates_range.side_effect = [[], [_bar(first_bar)]]
+    with caplog.at_level("INFO", logger="history"):
+        rows = history._pull_pair(terminal[0], "EURUSD", "M1", start, end, timedelta())
+    assert len(rows) == 1
+    assert "available coverage 2026-02-01" in caplog.text
+    assert "1 requested chunks returned no bars" in caplog.text
+    assert "export coverage may be partial" in caplog.text
