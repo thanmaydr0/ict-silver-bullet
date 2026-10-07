@@ -33,3 +33,18 @@ From this directory, run `python -m pytest` and
 `python -c "import brain.config, executor.config, brain.db.supabase_client"`.
 Future process entry points are listed in `AGENTS.md`; they currently raise `NotImplementedError`.
 Deployment scripts and instructions will be added in a later phase.
+
+## Deployment
+
+Deploy on the always-on EC2 Windows instance using
+[the Windows deployment guide](deploy/windows/README-deploy.md). It documents
+the HTTPS clone with a read-only token, manual `.env` creation, bootstrap,
+interactive logon tasks, reboot test, safe updates and troubleshooting.
+
+Run `deploy/windows/bootstrap.ps1`, then `deploy/windows/install_tasks.ps1`
+with the MT5 executable path. Auto-logon must be configured; disconnect RDP
+instead of signing out. Restrict dashboard TCP port 7860 to your IP.
+The dashboard runs separately with `python -m brain.dashboard`, requires
+`DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`, and refreshes every 10 seconds.
+Use `status.ps1` for task/log status and `update.ps1` for guarded main updates.
+See the guide for schema-dependent limits on floating P/L and setup evidence.
