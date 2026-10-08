@@ -53,12 +53,31 @@ foreach ($Name in $TaskNames) {
         $PythonExe = Join-Path $RepoRoot "$($Spec[0])\.venv\Scripts\python.exe"
         $Stdout = Join-Path $LogDir "$($Spec[2]).out.log"
         $Stderr = Join-Path $LogDir "$($Spec[2]).err.log"
-        # PowerShell wrapper waits for Python and propagates its exit code so
-        # Scheduler's failure restarts work. Append retains previous startup errors.
-        # NOTE: Native stderr in PS 5.1 may include NativeCommandError formatting.
-        $Command = '$ErrorActionPreference = ''Continue''; Set-Location -LiteralPath ' + (Quote-PSLiteral $RepoRoot) +
-            '; & ' + (Quote-PSLiteral $PythonExe) + ' -u -m ' + $Spec[1] +
-            ' 1>> ' + (Quote-PSLiteral $Stdout) + ' 2>> ' + (Quote-PSLiteral $Stderr) + '; exit $LASTEXITCODE'
+        # NOTE: Start Python in a separate hidden console and redirect at the
+        # process level. Ordinary logging on stderr must not become PS errors.
+        # This does not allow an interactive task to survive Windows sign-out.
+        # Start-Process overwrites redirect files; archive each previous run first.
+        $Command = @'
+$ErrorActionPreference = 'Stop'
+$Stdout = {{STDOUT}}
+$Stderr = {{STDERR}}
+try {
+    foreach ($LogPath in @($Stdout, $Stderr)) {
+        if (Test-Path -LiteralPath $LogPath) {
+            $Archive = $LogPath + '.' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff') + '.' + $PID + '.previous'
+            Move-Item -LiteralPath $LogPath -Destination $Archive
+        }
+    }
+    $Child = Start-Process -FilePath {{PYTHON}} -ArgumentList {{ARGS}} -WorkingDirectory {{ROOT}} -WindowStyle Hidden -RedirectStandardOutput $Stdout -RedirectStandardError $Stderr -Wait -PassThru
+    exit $Child.ExitCode
+} catch {
+    Add-Content -LiteralPath $Stderr -Encoding UTF8 -Value ('Launcher failure: ' + $_.Exception.Message)
+    exit 1
+}
+'@
+        $Command = $Command.Replace('{{STDOUT}}', (Quote-PSLiteral $Stdout)).Replace(
+            '{{STDERR}}', (Quote-PSLiteral $Stderr)).Replace('{{PYTHON}}', (Quote-PSLiteral $PythonExe)).Replace(
+            '{{ARGS}}', (Quote-PSLiteral "-u -m $($Spec[1])")).Replace('{{ROOT}}', (Quote-PSLiteral $RepoRoot))
         $Encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
         $Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
             -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -EncodedCommand $Encoded" -WorkingDirectory $RepoRoot

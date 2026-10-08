@@ -72,17 +72,74 @@ start-when-available, ignore duplicate instances, and a failure restart every
 minute up to the documented XML schema maximum of 255 attempts
 ([Microsoft Count schema](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-count-restarttype-element)).
 
-Python stdout appends to `logs\<name>.out.log`; stderr appends to
+Python stdout goes to `logs\<name>.out.log`; raw stderr goes to
 `logs\<name>.err.log`. Names are `candles`, `executor`, `equity`, `watchdog`,
 `brain`, `dashboard`. Application logs may additionally use shared
-`brain.log` / `executor.log` files. In PowerShell 5.1 native stderr can contain
-`NativeCommandError` formatting; the original startup error is retained.
-Monitor disk use and archive the append-only task output logs periodically.
+`brain.log` / `executor.log` files. The launcher uses `Start-Process` with a
+separate hidden console, waits for Python, and returns its exit code to Task
+Scheduler. Process-level stream redirection keeps ordinary stderr logging
+out of PowerShell's error pipeline. Before each start, any prior output file
+is moved to `<name>.<out/err>.log.<UTC timestamp>.<launcher PID>.previous`;
+startup errors from earlier runs remain available. Monitor disk use and
+archive/remove old `.previous` files periodically after reviewing them.
 The terminal itself is a GUI task, so inspect MT5's own Journal for errors.
 
 `status.ps1 -Tail 20` shows task state, last result, terminal PIDs, and all log
 tails without requiring a network connection. The dashboard displays equity
 snapshot age and a stale warning after 30 seconds.
+
+## Console interruption diagnosis and launcher upgrade
+
+`0xC000013A` is Windows `STATUS_CONTROL_C_EXIT`, a console interruption
+([Microsoft NTSTATUS values](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-erref/596a1078-e883-4972-9bbc-49e60bebca55)).
+It does not, by itself, identify who/what interrupted the process. Check task
+history and session events; do not conclude that Python crashed from this
+code alone. Older launchers wrapped even INFO logs on stderr in
+`NativeCommandError`/`RemoteException`; those labels do not turn an INFO line
+into a Python exception. Old application/test log entries are also not
+evidence of a current failure: compare their timestamps to the task run.
+
+`status.ps1 -History` includes recent ICT Task Scheduler events and matching
+Python module PIDs/session IDs. It warns if a matching Python process remains
+while its scheduled task is not Running. Inspect such a manual/orphaned
+instance before starting another copy, especially the trading Executor.
+This diagnostic never kills processes or starts tasks. If history is disabled,
+enable **Task Scheduler > Enable All Tasks History**, reproduce, and rerun
+status. Event 111 records task termination; 201 records the action result.
+There may be no retained evidence for an interruption before history was enabled.
+
+Pulling Git alone does not change registered task actions. To install the new
+launcher while preserving the existing terminal executable path:
+
+```powershell
+Set-Location C:\ict-silver-bullet\ict-silver-bullet
+Set-ExecutionPolicy -Scope Process Bypass
+$TerminalPath = (Get-ScheduledTask -TaskName 'ICT-MT5Terminal').Actions[0].Execute
+git pull --ff-only origin main
+if ($LASTEXITCODE -ne 0) { throw 'Git update failed' }
+.\deploy\windows\status.ps1 -History
+.\deploy\windows\install_tasks.ps1 -TerminalPath $TerminalPath
+```
+
+Registration does not stop or restart currently running tasks. A running task
+will use the new launcher on its next start. For the reported case where all
+six Python tasks are Ready, after verifying there are no remaining matching
+Python processes, MT5 is running and logged into the correct account, start
+the stopped tasks with Executor last:
+
+```powershell
+foreach ($Name in @('ICT-Candles', 'ICT-Equity', 'ICT-Watchdog', 'ICT-Dashboard', 'ICT-Brain', 'ICT-Executor')) {
+    if ((Get-ScheduledTask -TaskName $Name).State -ne 'Running') {
+        Start-ScheduledTask -TaskName $Name
+    }
+}
+Start-Sleep -Seconds 15
+.\deploy\windows\status.ps1 -History
+```
+
+If the interruption recurs while you remain connected and do not stop any
+tasks, capture that history output. A separate hidden Python console improves
+launcher isolation; interactive tasks still cannot survive Windows sign-out.
 
 ## Updates
 

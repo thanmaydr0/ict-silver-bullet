@@ -112,8 +112,10 @@ def test_install_is_idempotent_and_uses_interactive_logon(registration):
             command = base64.b64decode(encoded).decode("utf-16-le")
             package = "brain" if task["Name"] in ("ICT-Brain", "ICT-Dashboard") else "executor"
             assert f"{package}\\.venv\\Scripts\\python.exe" in command
-            assert "2>>" in command and ".err.log" in command
-            assert "exit $LASTEXITCODE" in command
+            assert "-RedirectStandardError $Stderr" in command and ".err.log" in command
+            assert "-WindowStyle Hidden" in command
+            assert "-Wait -PassThru" in command
+            assert "exit $Child.ExitCode" in command
 
 
 def test_uninstall_stops_and_removes_all_tasks(registration):
@@ -127,20 +129,87 @@ def test_uninstall_stops_and_removes_all_tasks(registration):
     assert result["Stopped"][0:2] == ["ICT-Brain", "ICT-Executor"]
 
 
-def test_python_wrapper_preserves_stderr_and_exit_code(registration):
+@pytest.mark.parametrize("exit_code,line", [(7, "startup failure"), (0, "INFO | outside_killzone")])
+def test_python_wrapper_preserves_stderr_and_exit_code(registration, exit_code, line):
     root, script, terminal, harness = registration
     output = ps(harness + f"& {quote(script)} -TerminalPath {quote(terminal)} | Out-Null; "
                 "Write-Output ('RESULT:' + $global:Registered['ICT-Executor'].Action.Argument)")
     command = base64.b64decode(output.split("RESULT:")[-1].split()[-1]).decode("utf-16-le")
     command = command.replace(str(root / "executor" / ".venv" / "Scripts" / "python.exe"), sys.executable)
     command = command.replace("executor.order_executor", "mock_entry")
-    (root / "mock_entry.py").write_text("import sys\nprint('startup failure', file=sys.stderr)\nsys.exit(7)\n", encoding="utf-8")
+    (root / "mock_entry.py").write_text(f"import sys\nprint({line!r}, file=sys.stderr)\nsys.exit({exit_code})\n", encoding="utf-8")
     encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
     result = subprocess.run([PS, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
                             capture_output=True, timeout=30)
-    assert result.returncode == 7
-    stderr = (root / "logs" / "executor.err.log").read_text(encoding="utf-16")
-    assert "startup failure" in stderr
+    assert result.returncode == exit_code
+    stderr = (root / "logs" / "executor.err.log").read_text(encoding="utf-8-sig")
+    assert line in stderr
+    assert "NativeCommandError" not in stderr
+    assert "RemoteException" not in stderr
+    # A second run must archive, not erase, the previous startup failure.
+    result = subprocess.run([PS, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                            capture_output=True, timeout=30)
+    assert result.returncode == exit_code
+    previous = list((root / "logs").glob("executor.err.log.*.previous"))
+    assert len(previous) == 1
+    assert line in previous[0].read_text(encoding="utf-8-sig")
+
+
+def test_launcher_records_failure_to_start_python(registration):
+    root, script, terminal, harness = registration
+    output = ps(harness + f"& {quote(script)} -TerminalPath {quote(terminal)} | Out-Null; "
+                "Write-Output ('RESULT:' + $global:Registered['ICT-Dashboard'].Action.Argument)")
+    command = base64.b64decode(output.split("RESULT:")[-1].split()[-1]).decode("utf-16-le")
+    command = command.replace(str(root / "brain" / ".venv" / "Scripts" / "python.exe"), str(root / "missing.exe"))
+    encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    result = subprocess.run([PS, "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                            capture_output=True, timeout=30)
+    assert result.returncode == 1
+    assert "Launcher failure:" in (root / "logs" / "dashboard.err.log").read_text(encoding="utf-8-sig")
+
+
+def test_status_reports_interruption_and_filters_history(tmp_path):
+    source = quote(SCRIPTS / "status.ps1")
+    harness = r"""
+function Get-ScheduledTask { param($TaskName,$ErrorAction)
+    return [pscustomobject]@{State='Ready'}
+}
+function Get-ScheduledTaskInfo { param($TaskName)
+    return [pscustomobject]@{LastRunTime=[datetime]'2026-10-08T06:19:13';LastTaskResult=[uint32]3221225786}
+}
+function Get-Process { param($Name,$ErrorAction) }
+function Get-ChildItem { param($LiteralPath,$Filter,[switch]$File,$ErrorAction) }
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
+    return [pscustomobject]@{CommandLine='python.exe -u -m brain.app';ProcessId=1234;ParentProcessId=1000;
+        SessionId=1;ExecutablePath='C:\Python310\python.exe'}
+}
+function Get-WinEvent { param($FilterHashtable,$MaxEvents,$ErrorAction)
+    $First = [pscustomobject]@{TimeCreated=[datetime]'2026-10-08T06:19:39';Id=111;Message='ICT task was terminated'}
+    $First | Add-Member -MemberType ScriptMethod -Name ToXml -Value { '<Event><EventData><Data Name="TaskName">\ICT-Brain</Data></EventData></Event>' }
+    $Other = [pscustomobject]@{TimeCreated=[datetime]'2026-10-08T06:19:40';Id=111;Message='UNRELATED TASK'}
+    $Other | Add-Member -MemberType ScriptMethod -Name ToXml -Value { '<Event><EventData><Data Name="TaskName">\OtherApp</Data></EventData></Event>' }
+    return @($First,$Other)
+}
+"""
+    output = ps(harness + f"& {source} -History")
+    assert "0xC000013A" in output
+    assert "console interruption" in output
+    assert "ICT task was terminated" in output
+    assert "UNRELATED TASK" not in output
+    assert "manual/orphaned instance" in " ".join(output.split()), output
+    assert "1234" in output
+
+
+def test_status_survives_unavailable_task_history():
+    harness = r"""
+function Get-ScheduledTask { param($TaskName,$ErrorAction) }
+function Get-Process { param($Name,$ErrorAction) }
+function Get-ChildItem { param($LiteralPath,$Filter,[switch]$File,$ErrorAction) }
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction) }
+function Get-WinEvent { param($FilterHashtable,$MaxEvents,$ErrorAction) throw 'History disabled' }
+"""
+    output = ps(harness + f"& {quote(SCRIPTS / 'status.ps1')} -History")
+    assert "Task history unavailable or empty" in output
 
 
 @pytest.fixture
