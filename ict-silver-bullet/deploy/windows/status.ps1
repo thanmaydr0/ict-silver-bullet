@@ -1,6 +1,7 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([ValidateRange(1, 200)][int]$Tail = 10, [switch]$History)
+param([ValidateRange(1, 200)][int]$Tail = 10, [switch]$History,
+    [switch]$Health, [ValidateRange(1,65535)][int]$DashboardPort = 7860)
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $Names = @('ICT-MT5Terminal', 'ICT-Candles', 'ICT-Executor', 'ICT-Equity', 'ICT-Watchdog', 'ICT-Brain', 'ICT-Dashboard')
@@ -13,6 +14,12 @@ $Rows = foreach ($Name in $Names) {
     } else { [pscustomobject]@{ Task = $Name; State = 'Not installed'; LastRun = $null; LastResult = $null } }
 }
 $Rows | Format-Table -AutoSize
+if ($Health) {
+    try {
+        $DashboardHealth = Invoke-RestMethod -Uri "http://127.0.0.1:$DashboardPort/healthz" -TimeoutSec 2
+        Write-Host "Dashboard health: $($DashboardHealth.status); Vite build: $($DashboardHealth.build_id); API v$($DashboardHealth.schema_version)"
+    } catch { Write-Warning 'Dashboard health endpoint unavailable. Check dashboard.err.log and the configured bind address/port.' }
+}
 Write-Host 'Result 0x00000000 = success; 0x00041301 = still running; 0xC000013A = console interruption.'
 if (@($Rows | Where-Object { $_.LastResult -eq '0xC000013A' -and $_.State -ne 'Running' }).Count -gt 0) {
     Write-Warning 'Tasks report console interruptions and are not Running. Check console closure, Windows sign-out/session policy, manual stops, and task history. This code alone does not identify the cause.'

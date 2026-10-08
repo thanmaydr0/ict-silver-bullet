@@ -8,3 +8,11 @@ logs/
 backtest/data/
 *.parquet
 .pytest_cache/
+frontend/node_modules/
+frontend/dist/
+frontend/dist.next/
+frontend/dist.previous/
+frontend/dist.failed/
+frontend/playwright-report/
+frontend/test-results/
+frontend/*.tsbuildinfo

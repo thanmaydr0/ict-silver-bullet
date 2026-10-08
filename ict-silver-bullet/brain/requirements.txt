@@ -5,8 +5,8 @@ requests
 tzdata
 numpy
 pandas
-plotly
-gradio
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
 firecrawl-py
 anthropic
 openai

@@ -1,8 +1,11 @@
 #requires -Version 5.1
 [CmdletBinding()]
-param([switch]$Force)
+param([switch]$Force, [switch]$DashboardOnly, [string]$RepositoryRoot)
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+$RepoRoot = if ($RepositoryRoot) { (Resolve-Path -LiteralPath $RepositoryRoot).Path } else {
+    (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
+}
+$DeployDir = Join-Path $RepoRoot 'deploy\windows'
 $ExecutorPython = Join-Path $RepoRoot 'executor\.venv\Scripts\python.exe'
 $BrainPython = Join-Path $RepoRoot 'brain\.venv\Scripts\python.exe'
 $StopOrder = @('ICT-Brain', 'ICT-Executor', 'ICT-Watchdog', 'ICT-Equity', 'ICT-Candles', 'ICT-Dashboard', 'ICT-MT5Terminal')
@@ -50,6 +53,41 @@ try {
     if ($LASTEXITCODE -ne 0 -or $Branch -ne 'main') { throw 'Updates must run on main.' }
     $Dirty = & git status --porcelain
     if ($LASTEXITCODE -ne 0 -or $Dirty) { throw 'Working tree must be clean before updating.' }
+    if ($DashboardOnly) {
+        if ($Force) { throw '-Force cannot be combined with -DashboardOnly.' }
+        & git fetch origin main
+        if ($LASTEXITCODE -ne 0) { throw 'Fetch failed.' }
+        & git merge-base --is-ancestor HEAD origin/main
+        if ($LASTEXITCODE -ne 0) { throw 'Dashboard-only update requires a fast-forward from HEAD to origin/main.' }
+        $ChangedFiles = @(& git diff --name-only HEAD origin/main)
+        if ($LASTEXITCODE -ne 0) { throw 'Could not inspect incoming changes.' }
+        # Git root may be the parent of this app directory (the documented clone).
+        $GitPrefix = (& git rev-parse --show-prefix).Trim()
+        if ($LASTEXITCODE -ne 0) { throw 'Could not determine repository layout.' }
+        $Allowed = '^(frontend/|brain/dashboard(?:_api|_auth|_data|_models|_dev)?\.py$|scripts/export_dashboard_schema\.py$|tests/brain/test_dashboard[^/]*\.py$|tests/deploy/test_windows_scripts\.py$|deploy/windows/(?:build_frontend|status|update)\.ps1$|deploy/windows/README-deploy\.md$|README\.md$|\.gitignore$)'
+        foreach ($File in $ChangedFiles) {
+            if (-not $File.StartsWith($GitPrefix) -or $File.Substring($GitPrefix.Length) -notmatch $Allowed) {
+                throw "Incoming change $File requires the full guarded update."
+            }
+        }
+        foreach ($Package in @('brain', 'executor')) {
+            if (Test-Path -LiteralPath (Join-Path $RepoRoot "logs\$Package.requirements-pending")) { throw 'Pending Python dependency repair requires full update.' }
+        }
+        Get-ScheduledTask -TaskName 'ICT-Dashboard' -ErrorAction Stop | Out-Null
+        # Stop before advancing Python source; failure keeps trading tasks intact.
+        Stop-ScheduledTask -TaskName 'ICT-Dashboard'
+        $Deadline = (Get-Date).AddSeconds(30)
+        while ((Get-ScheduledTask -TaskName 'ICT-Dashboard').State -eq 'Running') {
+            if ((Get-Date) -gt $Deadline) { throw 'ICT-Dashboard did not stop.' }
+            Start-Sleep -Milliseconds 500
+        }
+        & git merge --ff-only origin/main
+        if ($LASTEXITCODE -ne 0) { throw 'Dashboard-only fast-forward failed.' }
+        & (Join-Path $DeployDir 'build_frontend.ps1')
+        Start-ScheduledTask -TaskName 'ICT-Dashboard'
+        Write-Host 'Dashboard updated. Verify status.ps1 -Health; trading tasks were left running.'
+        return
+    }
     foreach ($PythonExe in @($ExecutorPython, $BrainPython)) {
         if (-not (Test-Path -LiteralPath $PythonExe)) { throw 'Run bootstrap.ps1 first.' }
     }
@@ -101,6 +139,7 @@ try {
             Remove-Item -LiteralPath $Pending
         } else { Write-Host "$Package requirements unchanged; skipping pip." }
     }
+    & (Join-Path $DeployDir 'build_frontend.ps1')
     # Keep a running terminal intact; restarting its GUI is unnecessary for code updates.
     # NOTE: MT5 is started if absent; an existing GUI terminal is never interrupted.
     if (-not (Get-Process -Name terminal64 -ErrorAction SilentlyContinue)) {

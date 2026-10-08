@@ -1,7 +1,8 @@
 # Deploy on the always-on EC2 Windows instance
 
 Run these commands **on EC2**, in Windows PowerShell 5.1, as the same Windows
-user that runs MT5. Install Git and 64-bit Python 3.10+ first (on PATH).
+user that runs MT5. Install Git, 64-bit Python 3.10+, and Node.js 24 LTS
+(including npm) first, then open a new PowerShell so they are on PATH.
 Configure Windows auto-logon for that user before the reboot test. The tasks
 run only while that user is logged on; a boot without auto-logon starts nothing.
 Install MT5, log into the intended account, enable algorithmic trading, and
@@ -55,7 +56,7 @@ the reboot and RDP reconnection:
 ```powershell
 Set-Location C:\ict-silver-bullet\ict-silver-bullet
 Set-ExecutionPolicy -Scope Process Bypass
-.\deploy\windows\status.ps1
+.\deploy\windows\status.ps1 -Health
 Start-Process 'http://<Elastic IP>:7860'
 ```
 
@@ -85,8 +86,11 @@ archive/remove old `.previous` files periodically after reviewing them.
 The terminal itself is a GUI task, so inspect MT5's own Journal for errors.
 
 `status.ps1 -Tail 20` shows task state, last result, terminal PIDs, and all log
-tails without requiring a network connection. The dashboard displays equity
-snapshot age and a stale warning after 30 seconds.
+tails without requiring a network connection. Add `-Health` for a two-second
+localhost HTTP check showing the Vite build ID and API version; use
+`-DashboardPort` when overriding 7860. A tailnet-only bind needs a health check
+at that configured IP instead. The dashboard displays source ages and stale
+warnings, including when the reporter stops publishing but Supabase still answers.
 
 ## Console interruption diagnosis and launcher upgrade
 
@@ -143,11 +147,40 @@ launcher isolation; interactive tasks still cannot survive Windows sign-out.
 
 ## Updates
 
+### First upgrade from Gradio to Vite
+
+Install Node.js 24 LTS and reopen PowerShell first. The old updater cannot build
+Vite assets, so fetch the new updater into your temporary directory and run it
+against the existing checkout. Fetching does not change the running source.
+This performs the full guarded update because Python requirements change:
+
+```powershell
+Set-Location C:\ict-silver-bullet\ict-silver-bullet
+Set-ExecutionPolicy -Scope Process Bypass
+git fetch origin main
+if ($LASTEXITCODE -ne 0) { throw 'Git fetch failed' }
+$Updater = Join-Path $env:TEMP 'ict-vite-update.ps1'
+$UpdaterSource = git show origin/main:ict-silver-bullet/deploy/windows/update.ps1
+if ($LASTEXITCODE -ne 0) { throw 'Could not retrieve the new updater' }
+Set-Content -LiteralPath $Updater -Value $UpdaterSource -Encoding UTF8
+& $Updater -RepositoryRoot (Get-Location).Path
+.\deploy\windows\status.ps1 -Health
+```
+
+The position guard may refuse this update; close positions before retrying.
+Existing credentials, port, task registration and hidden Python launcher stay
+the same. `python -m brain.dashboard` now serves FastAPI and the compiled React
+app. A permanent Node process is not needed. Missing or corrupt assets refuse
+startup with a build instruction in `dashboard.err.log`. Reload the browser
+and sign in after the upgrade.
+
+### Subsequent updates
+
 ```powershell
 Set-Location C:\ict-silver-bullet\ict-silver-bullet
 Set-ExecutionPolicy -Scope Process Bypass
 .\deploy\windows\update.ps1
-.\deploy\windows\status.ps1
+.\deploy\windows\status.ps1 -Health
 ```
 
 Updates require a clean checkout on `main`. The script checks both database
@@ -158,6 +191,10 @@ then pulls `origin main` and reinstalls a venv's requirements only when its
 requirements changed (including Brain ML and backtest dependencies). A failed
 dependency install leaves a pending marker so the next retry repairs it even
 when Git already contains the new requirements.
+Frontend input hashes include source, package lock, TypeScript/Vite settings
+and build scripts. Changed inputs or a pending build run `npm.cmd ci` and build
+to `frontend\dist.next`. The manifest and referenced assets are validated
+before promotion; failures retain the current `dist` and the pending marker.
 On success it starts data/reporting services before Brain, with Executor last.
 A running MT5 terminal is retained; an absent terminal is started and given
 60 seconds to initialize. Manual task starts do not use the logon delay.
@@ -173,6 +210,70 @@ positions, use the explicit override:
 ```powershell
 .\deploy\windows\update.ps1 -Force
 ```
+
+For later changes confined to dashboard code, frontend or its deployment/docs:
+
+```powershell
+.\deploy\windows\update.ps1 -DashboardOnly
+.\deploy\windows\status.ps1 -Health
+```
+
+This inspects incoming paths and refuses shared Python dependency, trading,
+configuration or other changes before stopping anything. It stops only
+ICT-Dashboard, fast-forwards, builds and restarts only ICT-Dashboard. Trading
+tasks continue. A pending Python install requires the full update. If the build
+fails, fix the error and rerun; the prior bundle remains, but the dashboard
+stays stopped because its Python code has advanced. The flag does not bypass
+the position guard for a full update.
+
+### Frontend recovery
+
+`dist.previous` holds the previous production bundle. Earlier hashed assets
+are retained in each promoted build for already-open browser tabs. Review disk
+use periodically; clean old assets only with the dashboard stopped and clients
+reloaded. Do not serve a previous frontend against an incompatible API version.
+The API contract here remains version 1.
+
+To restore the previous build after reviewing API compatibility, with the
+dashboard stopped (and from the app directory):
+
+```powershell
+Stop-ScheduledTask -TaskName 'ICT-Dashboard'
+if ((Get-ScheduledTask -TaskName 'ICT-Dashboard').State -eq 'Running') { throw 'Wait for dashboard to stop' }
+if (-not (Test-Path -LiteralPath '.\frontend\dist.previous\build.json')) { throw 'No previous build' }
+if (Test-Path -LiteralPath '.\frontend\dist.failed') { throw 'Move or review the existing dist.failed first' }
+Move-Item -LiteralPath '.\frontend\dist' -Destination '.\frontend\dist.failed'
+Move-Item -LiteralPath '.\frontend\dist.previous' -Destination '.\frontend\dist'
+Start-ScheduledTask -TaskName 'ICT-Dashboard'
+.\deploy\windows\status.ps1 -Health
+```
+
+For a missing initial build, run `build_frontend.ps1` while ICT-Dashboard is
+stopped, then start that task. Rebuilding the current source is the preferred
+recovery. A frontend rollback does not roll back Python dependencies or Git.
+
+### Sessions and HTTPS
+
+All data endpoints require a cookie session; `/healthz` returns only a build ID,
+status and schema version. Login/logout require an exact same-origin browser
+request. Sessions expire after eight hours, logout revokes them, and restarting
+the single Python worker logs everyone out. Ten login attempts per IP per five
+minutes are allowed. No Supabase key or session token enters local storage.
+
+For HTTPS terminated at a trusted reverse proxy, manually add these optional
+settings to `brain\.env` (process environment overrides them):
+
+```text
+DASHBOARD_COOKIE_SECURE=true
+DASHBOARD_TRUSTED_PROXY_IP=127.0.0.1
+```
+
+Use the actual proxy IP and restrict backend access to it. Only that explicit IP
+may supply forwarded protocol/client headers; wildcards are rejected. Preserve
+the original Host and Origin. Bind the backend to loopback for a proxy on the
+same instance. Plain HTTP mode remains available for the existing private
+connection; use encrypted access before sending credentials over public networks.
+Local Vite development uses HTTP and requires secure-cookie mode off.
 
 To remove task registration (including stopping tasks):
 
@@ -190,20 +291,22 @@ show `Unavailable (not reported)` until the reporter/schema supplies
 For a faithful setup audit, persist a signal `setup` JSON object with the
 original `candles` window (UTC `ts`, open/high/low/close), `fvg` (top/bottom),
 `ob` (high/low), `mss` (level) and `sweep` (level or wick_extreme). The dashboard
-accepts a dict or list for each detector field. Without this evidence it shows
-available pre-signal M1 candle context and explicitly marks missing overlays.
-An old signal outside the latest 500 candles can have no available window.
+accepts a dictionary or list of dictionaries for each detector field. Without this evidence it queries
+up to 100 pre-signal M1 candles and explicitly marks missing overlays. It never
+uses candles after detection or recomputes detector evidence.
 
 The equity curve shows 24 hours, caches history for one minute, and refreshes
 the latest point/gauges every 10 seconds. Large histories retain bucket
-extrema and drawdown peaks for display; reference lines follow the persisted
+equity/reference-line extrema and drawdown peaks for display; reference lines follow the persisted
 daily and overall baselines rather than assuming a fixed balance.
 
 The ±15-minute news blackout requires a read of events in the preceding
 15 minutes as well as `get_upcoming_news`; this dashboard reads the complete
 ±15-minute gate using the existing
-Supabase client's read machinery without changing its interface. If the recent
-read fails, blackout is unknown. The killzone label indicates window timing;
+Supabase SDK in a strict read adapter with five-second request timeouts, without
+changing existing DB interfaces. History pagination is bounded to 50,000 rows
+and a deadline, with overflow/errors reported as stale or unavailable. If the
+news read fails or its data ages beyond 30 seconds, blackout is unknown. The killzone label indicates window timing;
 it does not certify the pipeline is running or all risk guards permit entries.
 
 Production scripts have only been parsed and tested with mocks here; perform

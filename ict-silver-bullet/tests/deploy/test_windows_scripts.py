@@ -222,6 +222,8 @@ def update_harness(tmp_path):
     source = (SCRIPTS / "update.ps1").read_text(encoding="utf-8")
     script = target / "update.ps1"
     script.write_text(source.replace("Scripts\\python.exe", "Scripts\\python.ps1"), encoding="utf-8")
+    (target / "build_frontend.ps1").write_text(
+        "$global:BuildCalls++; if ($global:FailBuild) { throw 'Mock build failed' }", encoding="utf-8")
     for package in ("brain", "executor"):
         shim = root / package / ".venv" / "Scripts" / "python.ps1"
         shim.parent.mkdir(parents=True)
@@ -245,10 +247,15 @@ $global:Stopped=@()
 $global:Started=@()
 $global:Pulls=0
 $global:ChangeRequirements=$false
+$global:BuildCalls=0
+$global:FailBuild=$false
+$global:ChangedFiles=@()
 function git {
     $global:LASTEXITCODE=0
     if ($args[0] -eq 'branch') { return 'main' }
     if ($args[0] -eq 'status') { return }
+    if ($args[0] -eq 'diff') { return $global:ChangedFiles }
+    if ($args[0] -eq 'rev-parse') { return 'ict-silver-bullet/' }
     if ($args[0] -eq 'pull') {
         $global:Pulls++
         if ($global:ChangeRequirements) {
@@ -330,3 +337,83 @@ def test_update_force_is_an_explicit_guard_override(update_harness):
     result = json.loads(output.split("RESULT:")[-1])
     assert result["GuardCalls"] == 0
     assert result["Started"][-1] == "ICT-Executor"
+
+
+def test_frontend_failure_leaves_full_update_stopped(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "$global:FailBuild=$true; "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Builds=$global:BuildCalls;Started=$global:Started.Count;Stopped=$global:Stopped.Count;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Builds"] == 1 and result["Stopped"] == 6 and result["Started"] == 0
+    assert "build failed" in result["Caught"]
+
+
+def test_downloaded_updater_uses_explicit_app_root(update_harness,tmp_path):
+    root,script,harness=update_harness
+    downloaded=tmp_path/"downloaded-updater.ps1"
+    shutil.copy(script,downloaded)
+    output=ps(harness + f"& {quote(downloaded)} -RepositoryRoot {quote(root)} | Out-Null; "
+              "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Builds=$global:BuildCalls;Started=$global:Started}))")
+    result=json.loads(output.split("RESULT:")[-1])
+    assert result["Builds"] == 1 and result["Started"][-1] == "ICT-Executor"
+
+
+def test_dashboard_only_never_restarts_trading_tasks(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "$global:ChangedFiles=@('ict-silver-bullet/frontend/src/App.tsx'); "
+                f"& {quote(script)} -DashboardOnly | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Builds=$global:BuildCalls;Started=$global:Started;Stopped=$global:Stopped;GuardCalls=$global:GuardCalls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Started"] == result["Stopped"] == ["ICT-Dashboard"]
+    assert result["Builds"] == 1 and result["GuardCalls"] == 0
+
+
+@pytest.mark.parametrize("changed", ["brain/requirements.txt", "executor/order_executor.py", "brain/config.py"])
+def test_dashboard_only_refuses_shared_changes(update_harness, changed):
+    _, script, harness = update_harness
+    output = ps(harness + f"$global:ChangedFiles=@('ict-silver-bullet/{changed}'); "
+                f"try {{ & {quote(script)} -DashboardOnly | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Started=$global:Started.Count;Stopped=$global:Stopped.Count;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Started"] == result["Stopped"] == 0
+    assert "full guarded update" in result["Caught"]
+
+
+def test_build_retries_and_preserves_current_and_hashed_assets(tmp_path):
+    root = tmp_path / "repo with spaces"
+    target = root / "deploy" / "windows"
+    target.mkdir(parents=True)
+    script = target / "build_frontend.ps1"
+    shutil.copy(SCRIPTS / "build_frontend.ps1", script)
+    current = root / "frontend" / "dist"
+    (current / "assets").mkdir(parents=True)
+    (current / "assets" / "old-hash.js").write_text("old bundle", encoding="utf-8")
+    (current / "index.html").write_text('<script src="/assets/old-hash.js"></script>', encoding="utf-8")
+    (current / "build.json").write_text(json.dumps({"schema_version":1,"build_id":"old","source_hash":"old-source"}), encoding="utf-8")
+    harness = r"""
+$global:FailBuild=$true
+$global:NpmCi=0
+function node { $global:LASTEXITCODE=0; if ($args -contains '--source-hash') { return 'new-source' } }
+function npm.cmd {
+    $global:LASTEXITCODE=0
+    if ($args[0] -eq 'ci') { $global:NpmCi++; return }
+    if ($global:FailBuild) { $global:LASTEXITCODE=1; return }
+    New-Item -ItemType Directory -Path 'dist.next\assets' -Force | Out-Null
+    Set-Content -LiteralPath 'dist.next\assets\new-hash.js' -Value 'new bundle'
+    Set-Content -LiteralPath 'dist.next\index.html' -Value '<script src="/assets/new-hash.js"></script>'
+    Set-Content -LiteralPath 'dist.next\build.json' -Value '{"schema_version":1,"build_id":"new","source_hash":"new-source"}'
+}
+function Get-ScheduledTask { param($TaskName,$ErrorAction) return [pscustomobject]@{State='Ready'} }
+"""
+    output = ps(harness + f"try {{ & {quote(script)} | Out-Null }} catch {{ }}; "
+                f"$Preserved=Get-Content -LiteralPath {quote(current / 'build.json')} -Raw | ConvertFrom-Json; "
+                f"$Pending=Test-Path -LiteralPath {quote(root / 'logs/frontend.build-pending')}; "
+                "$global:FailBuild=$false; " + f"& {quote(script)} | Out-Null; & {quote(script)} | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Preserved=$Preserved.build_id;Pending=$Pending;NpmCi=$global:NpmCi}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result == {"Preserved":"old", "Pending":True, "NpmCi":2}
+    assert (current / "assets" / "old-hash.js").exists()
+    assert (current / "assets" / "new-hash.js").exists()
+    assert (root / "frontend" / "dist.previous" / "index.html").exists()
+    assert not (root / "logs" / "frontend.build-pending").exists()

@@ -24,6 +24,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "$Package dependency installation failed." }
     }
     New-Item -ItemType Directory -Path (Join-Path $RepoRoot 'logs') -Force | Out-Null
+    & (Join-Path $PSScriptRoot 'build_frontend.ps1')
     $Missing = $false
     foreach ($Package in @('brain', 'executor')) {
         if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot "$Package\.env"))) {
@@ -33,6 +34,6 @@ try {
     }
     Write-Host 'Configure Windows auto-logon for this user and log MT5 into the intended account.'
     Write-Host '.\deploy\windows\install_tasks.ps1 -TerminalPath "C:\Program Files\MetaTrader 5\terminal64.exe"'
-    Write-Host 'Reboot, reconnect with RDP, run status.ps1, and open http://<Elastic IP>:7860.'
+    Write-Host 'Reboot, reconnect with RDP, run status.ps1 -Health, and open http://<Elastic IP>:7860.'
     if ($Missing) { Write-Warning 'Create the missing .env files BEFORE installing/starting tasks.' }
 } finally { Pop-Location }

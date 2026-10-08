@@ -46,5 +46,10 @@ with the MT5 executable path. Auto-logon must be configured; disconnect RDP
 instead of signing out. Restrict dashboard TCP port 7860 to your IP.
 The dashboard runs separately with `python -m brain.dashboard`, requires
 `DASHBOARD_USERNAME` / `DASHBOARD_PASSWORD`, and refreshes every 10 seconds.
+It serves the Vite/React frontend and authenticated FastAPI endpoints on the
+same port. Node.js 24 LTS is required to build the frontend during bootstrap or
+updates; production does not run a Node service. See
+[frontend development and checks](frontend/README.md) and the deployment guide's
+**First upgrade from Gradio to Vite** steps for existing installations.
 Use `status.ps1` for task/log status and `update.ps1` for guarded main updates.
 See the guide for schema-dependent limits on floating P/L and setup evidence.

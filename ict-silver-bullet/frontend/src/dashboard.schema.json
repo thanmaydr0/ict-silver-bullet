@@ -1,0 +1,1026 @@
+{
+  "$defs": {
+    "Account": {
+      "additionalProperties": false,
+      "properties": {
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        },
+        "equity": {
+          "title": "Equity",
+          "type": "number"
+        },
+        "balance": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Balance"
+        },
+        "daily_dd_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Daily Dd Pct"
+        },
+        "overall_dd_pct": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overall Dd Pct"
+        }
+      },
+      "required": ["ts", "equity", "balance", "daily_dd_pct", "overall_dd_pct"],
+      "title": "Account",
+      "type": "object"
+    },
+    "Blackout": {
+      "additionalProperties": false,
+      "properties": {
+        "pair": {
+          "title": "Pair",
+          "type": "string"
+        },
+        "blocked": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Blocked"
+        }
+      },
+      "required": ["pair", "blocked"],
+      "title": "Blackout",
+      "type": "object"
+    },
+    "Candle": {
+      "additionalProperties": false,
+      "properties": {
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        },
+        "open": {
+          "title": "Open",
+          "type": "number"
+        },
+        "high": {
+          "title": "High",
+          "type": "number"
+        },
+        "low": {
+          "title": "Low",
+          "type": "number"
+        },
+        "close": {
+          "title": "Close",
+          "type": "number"
+        }
+      },
+      "required": ["ts", "open", "high", "low", "close"],
+      "title": "Candle",
+      "type": "object"
+    },
+    "EquityData": {
+      "additionalProperties": false,
+      "properties": {
+        "points": {
+          "items": {
+            "$ref": "#/$defs/EquityPoint"
+          },
+          "title": "Points",
+          "type": "array"
+        },
+        "latest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Account"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "window_hours": {
+          "default": 24,
+          "title": "Window Hours",
+          "type": "integer"
+        }
+      },
+      "required": ["points", "latest", "window_hours"],
+      "title": "EquityData",
+      "type": "object"
+    },
+    "EquityPoint": {
+      "additionalProperties": false,
+      "properties": {
+        "ts": {
+          "format": "date-time",
+          "title": "Ts",
+          "type": "string"
+        },
+        "equity": {
+          "title": "Equity",
+          "type": "number"
+        },
+        "daily_limit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Daily Limit"
+        },
+        "overall_limit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Overall Limit"
+        }
+      },
+      "required": ["ts", "equity", "daily_limit", "overall_limit"],
+      "title": "EquityPoint",
+      "type": "object"
+    },
+    "Gauge": {
+      "additionalProperties": false,
+      "properties": {
+        "value": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Value"
+        },
+        "soft": {
+          "title": "Soft",
+          "type": "number"
+        },
+        "hard": {
+          "title": "Hard",
+          "type": "number"
+        },
+        "limit": {
+          "title": "Limit",
+          "type": "number"
+        }
+      },
+      "required": ["value", "soft", "hard", "limit"],
+      "title": "Gauge",
+      "type": "object"
+    },
+    "Killzone": {
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": ["armed", "idle"],
+          "title": "State",
+          "type": "string"
+        },
+        "active_window": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Active Window"
+        },
+        "closes_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Closes At"
+        },
+        "next_window": {
+          "title": "Next Window",
+          "type": "string"
+        },
+        "opens_at": {
+          "format": "date-time",
+          "title": "Opens At",
+          "type": "string"
+        }
+      },
+      "required": [
+        "state",
+        "active_window",
+        "closes_at",
+        "next_window",
+        "opens_at"
+      ],
+      "title": "Killzone",
+      "type": "object"
+    },
+    "NewsData": {
+      "additionalProperties": false,
+      "properties": {
+        "events": {
+          "items": {
+            "$ref": "#/$defs/NewsEvent"
+          },
+          "title": "Events",
+          "type": "array"
+        },
+        "blackout": {
+          "items": {
+            "$ref": "#/$defs/Blackout"
+          },
+          "title": "Blackout",
+          "type": "array"
+        }
+      },
+      "required": ["events", "blackout"],
+      "title": "NewsData",
+      "type": "object"
+    },
+    "NewsEvent": {
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "title": "Title",
+          "type": "string"
+        },
+        "currency": {
+          "title": "Currency",
+          "type": "string"
+        },
+        "scheduled_at": {
+          "format": "date-time",
+          "title": "Scheduled At",
+          "type": "string"
+        }
+      },
+      "required": ["title", "currency", "scheduled_at"],
+      "title": "NewsEvent",
+      "type": "object"
+    },
+    "Overlay": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "kind": {
+          "enum": ["line", "band"],
+          "title": "Kind",
+          "type": "string"
+        },
+        "bottom": {
+          "title": "Bottom",
+          "type": "number"
+        },
+        "top": {
+          "title": "Top",
+          "type": "number"
+        }
+      },
+      "required": ["label", "kind", "bottom", "top"],
+      "title": "Overlay",
+      "type": "object"
+    },
+    "Panel_EquityData_": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EquityData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[EquityData]",
+      "type": "object"
+    },
+    "Panel_NewsData_": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NewsData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[NewsData]",
+      "type": "object"
+    },
+    "Panel_RiskData_": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RiskData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[RiskData]",
+      "type": "object"
+    },
+    "Panel_SetupData_": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SetupData"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[SetupData]",
+      "type": "object"
+    },
+    "Panel_list_Position__": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Position"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[list[Position]]",
+      "type": "object"
+    },
+    "Panel_list_Trade__": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "default": "unavailable",
+          "enum": ["ready", "empty", "stale", "unavailable"],
+          "title": "Status",
+          "type": "string"
+        },
+        "data": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/Trade"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data"
+        },
+        "updated_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Updated At"
+        },
+        "message": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": "No data yet",
+          "title": "Message"
+        }
+      },
+      "required": ["status", "data", "updated_at", "message"],
+      "title": "Panel[list[Trade]]",
+      "type": "object"
+    },
+    "Position": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "pair": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pair"
+        },
+        "direction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Direction"
+        },
+        "leg": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Leg"
+        },
+        "lots": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Lots"
+        },
+        "floating_pnl": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Floating Pnl"
+        }
+      },
+      "required": ["id", "pair", "direction", "leg", "lots", "floating_pnl"],
+      "title": "Position",
+      "type": "object"
+    },
+    "RiskData": {
+      "additionalProperties": false,
+      "properties": {
+        "daily": {
+          "$ref": "#/$defs/Gauge"
+        },
+        "overall": {
+          "$ref": "#/$defs/Gauge"
+        }
+      },
+      "required": ["daily", "overall"],
+      "title": "RiskData",
+      "type": "object"
+    },
+    "SetupData": {
+      "additionalProperties": false,
+      "properties": {
+        "signal_id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Signal Id"
+        },
+        "pair": {
+          "title": "Pair",
+          "type": "string"
+        },
+        "direction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Direction"
+        },
+        "detected_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Detected At"
+        },
+        "candles": {
+          "items": {
+            "$ref": "#/$defs/Candle"
+          },
+          "title": "Candles",
+          "type": "array"
+        },
+        "overlays": {
+          "items": {
+            "$ref": "#/$defs/Overlay"
+          },
+          "title": "Overlays",
+          "type": "array"
+        },
+        "missing_evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Missing Evidence",
+          "type": "array"
+        },
+        "source": {
+          "enum": ["recorded", "historical_context"],
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "signal_id",
+        "pair",
+        "direction",
+        "detected_at",
+        "candles",
+        "overlays",
+        "missing_evidence",
+        "source"
+      ],
+      "title": "SetupData",
+      "type": "object"
+    },
+    "Trade": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Id"
+        },
+        "timestamp": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Timestamp"
+        },
+        "pair": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Pair"
+        },
+        "direction": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Direction"
+        },
+        "entry": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Entry"
+        },
+        "stop_loss": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Stop Loss"
+        },
+        "take_profit": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Take Profit"
+        },
+        "confluence_score": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Confluence Score"
+        },
+        "rr": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Rr"
+        },
+        "status": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Status"
+        },
+        "realized_r": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Realized R"
+        }
+      },
+      "required": [
+        "id",
+        "timestamp",
+        "pair",
+        "direction",
+        "entry",
+        "stop_loss",
+        "take_profit",
+        "confluence_score",
+        "rr",
+        "status",
+        "realized_r"
+      ],
+      "title": "Trade",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "default": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "generated_at": {
+      "format": "date-time",
+      "title": "Generated At",
+      "type": "string"
+    },
+    "collected_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Collected At"
+    },
+    "poll_seconds": {
+      "default": 10,
+      "title": "Poll Seconds",
+      "type": "integer"
+    },
+    "stale_after_seconds": {
+      "default": 30,
+      "title": "Stale After Seconds",
+      "type": "integer"
+    },
+    "equity": {
+      "$ref": "#/$defs/Panel_EquityData_"
+    },
+    "risk": {
+      "$ref": "#/$defs/Panel_RiskData_"
+    },
+    "killzone": {
+      "$ref": "#/$defs/Killzone"
+    },
+    "trades": {
+      "$ref": "#/$defs/Panel_list_Trade__"
+    },
+    "positions": {
+      "$ref": "#/$defs/Panel_list_Position__"
+    },
+    "news": {
+      "$ref": "#/$defs/Panel_NewsData_"
+    },
+    "setup": {
+      "$ref": "#/$defs/Panel_SetupData_"
+    }
+  },
+  "required": [
+    "schema_version",
+    "generated_at",
+    "collected_at",
+    "poll_seconds",
+    "stale_after_seconds",
+    "equity",
+    "risk",
+    "killzone",
+    "trades",
+    "positions",
+    "news",
+    "setup"
+  ],
+  "title": "DashboardSnapshot",
+  "type": "object"
+}
