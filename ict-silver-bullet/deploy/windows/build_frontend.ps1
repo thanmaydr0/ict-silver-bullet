@@ -38,8 +38,11 @@ Push-Location -LiteralPath $Frontend
 try {
     if (-not $PublishOnly) {
         if (-not (Get-Command node -ErrorAction SilentlyContinue) -or -not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) { throw 'Install Node.js 24 LTS (includes npm), then open a new PowerShell.' }
-        & node -e 'const [a,b]=process.versions.node.split(".").map(Number); if(a<22||(a===22&&b<12))process.exit(1)'
-        if ($LASTEXITCODE -ne 0) { throw 'Node.js 22.12+ required; use Node.js 24 LTS.' }
+        $NodeVersion = & node --version
+        if ($LASTEXITCODE -ne 0) { throw 'Could not read Node.js version.' }
+        try { $NodeRelease = [version]$NodeVersion.TrimStart('v') }
+        catch { throw 'Could not parse Node.js version; use Node.js 24 LTS.' }
+        if ($NodeRelease -lt [version]'22.12.0') { throw 'Node.js 22.12+ required; use Node.js 24 LTS.' }
         $Hash = & node scripts/write-build.mjs --source-hash
         if ($LASTEXITCODE -ne 0) { throw 'Could not hash frontend sources.' }
         $ValidCurrent = $null

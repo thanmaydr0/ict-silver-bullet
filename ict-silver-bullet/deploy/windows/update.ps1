@@ -39,7 +39,11 @@ finally:
     if "mt5" in globals():
         mt5.shutdown()
 '@
-    & $ExecutorPython -c $Check
+    # Windows PowerShell 5.1 strips embedded double quotes in native arguments.
+    # Encode the source; the small runner has only single-quoted Python strings.
+    $EncodedCheck = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Check))
+    $CheckRunner = "import base64;exec(compile(base64.b64decode('$EncodedCheck'), '<position-check>', 'exec'))"
+    & $ExecutorPython -c $CheckRunner
     $CheckResult = $LASTEXITCODE
     if ($CheckResult -ne 0) {
         $Reason = if ($CheckResult -eq 2) { 'Open positions exist.' } else { 'Position check failed or account could not be verified.' }

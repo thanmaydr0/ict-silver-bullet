@@ -9,7 +9,7 @@ try {
         $VenvPython = Join-Path $RepoRoot "$Package\.venv\Scripts\python.exe"
         if (-not (Test-Path -LiteralPath $VenvPython)) {
             Write-Host "Creating $Package virtual environment (Python 3.10+ required)..."
-            & $Python -c 'import sys; assert sys.version_info >= (3, 10), "Python 3.10+ required"'
+            & $Python -c 'import sys; assert sys.version_info >= (3, 10)'
             if ($LASTEXITCODE -ne 0) { throw 'Python version check failed.' }
             & $Python -m venv (Join-Path $RepoRoot "$Package\.venv")
             if ($LASTEXITCODE -ne 0) { throw "Could not create $Package venv." }

@@ -2,10 +2,12 @@
 
 import base64
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import venv
 
 import pytest
 
@@ -34,6 +36,72 @@ def test_all_scripts_parse_in_windows_powershell():
        "$tokens=$null; $errors=$null; "
        "[System.Management.Automation.Language.Parser]::ParseFile($_.FullName,[ref]$tokens,[ref]$errors) | Out-Null; "
        "if ($errors) { throw ($errors | Out-String) } }")
+
+
+@pytest.mark.parametrize("native_exit", [0, 2, 3])
+def test_position_check_transport_in_real_powershell_and_python(tmp_path, native_exit):
+    source = (SCRIPTS / "update.ps1").read_text(encoding="utf-8")
+    function = "function Assert-NoOpenPositions {" + source.split(
+        "function Assert-NoOpenPositions {", 1)[1].split("Push-Location", 1)[0]
+    check = re.search(r"\$Check = @'\n(.*?)\n'@", function, re.S)
+    assert check
+    original_guard = base64.b64encode(check.group(1).encode("utf-8")).decode("ascii")
+    expected = {"message": 'missing "database" response', "path": r"C:\Program Files\fixture", "unicode": "Caf\u00e9"}
+    # Compile the complete production guard without executing its imports. Only
+    # this harmless payload executes: no MT5, SDK, configuration or service calls.
+    payload = ("import base64, json, sys\n"
+               f'compile(base64.b64decode("{original_guard}"), "<guard-syntax>", "exec")\n'
+               f'payload = {json.dumps(expected, ensure_ascii=False)}\n'
+               'print("PAYLOAD:" + json.dumps(payload))\n'
+               f"sys.exit({native_exit})\n")
+    function = function[:check.start(1)] + payload.rstrip("\n") + function[check.end(1):]
+    runtime = tmp_path / "Python runtime with spaces"
+    venv.EnvBuilder(with_pip=False).create(runtime)
+    python = runtime / "Scripts" / "python.exe"
+    output = ps("$ErrorActionPreference='Stop'; " + function +
+                f"\n$ExecutorPython={quote(python)}; $Caught=$null; "
+                "try { Assert-NoOpenPositions } catch { $Caught=$_.Exception.Message }; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Exit=$LASTEXITCODE;Caught=$Caught}))")
+    assert json.loads(output.split("PAYLOAD:", 1)[1].splitlines()[0]) == expected
+    result = json.loads(output.split("RESULT:", 1)[1])
+    assert result["Exit"] == native_exit
+    if native_exit == 0:
+        assert result["Caught"] is None
+    else:
+        assert "Update aborted" in result["Caught"]
+        assert ("Open positions exist." if native_exit == 2 else "Position check failed") in output
+
+
+def test_bootstrap_python_version_check_uses_native_python():
+    source = (SCRIPTS / "bootstrap.ps1").read_text(encoding="utf-8")
+    command = next(line.strip() for line in source.splitlines() if "& $Python -c" in line)
+    output = ps(f"$Python={quote(sys.executable)}; " + command +
+                "; Write-Output ('RESULT:' + $LASTEXITCODE)")
+    assert output.split("RESULT:")[-1].strip() == "0"
+
+
+def test_frontend_version_and_hash_checks_use_real_node_without_installing(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js required for native argument regression")
+    root = tmp_path / "repo with spaces"
+    scripts = root / "deploy" / "windows"
+    scripts.mkdir(parents=True)
+    shutil.copy(SCRIPTS / "build_frontend.ps1", scripts)
+    frontend = root / "frontend"
+    (frontend / "scripts").mkdir(parents=True)
+    shutil.copy(SCRIPTS.parents[1] / "frontend" / "scripts" / "write-build.mjs", frontend / "scripts")
+    (frontend / "index.html").write_text("source fixture", encoding="utf-8")
+    hashed = subprocess.run([node, "scripts/write-build.mjs", "--source-hash"], cwd=frontend,
+                            capture_output=True, text=True, timeout=15, check=True).stdout
+    current = frontend / "dist"
+    (current / "assets").mkdir(parents=True)
+    (current / "assets" / "fixture.js").write_text("fixture", encoding="utf-8")
+    (current / "index.html").write_text('<script src="/assets/fixture.js"></script>', encoding="utf-8")
+    (current / "build.json").write_text(json.dumps({"schema_version":1,"build_id":"fixture","source_hash":hashed}),encoding="utf-8")
+    output = ps("function npm.cmd { throw 'Test must not install packages or call the network' }; "
+                f"& {quote(scripts / 'build_frontend.ps1')} -StageOnly")
+    assert "Frontend unchanged: fixture" in output
 
 
 @pytest.fixture
@@ -394,7 +462,7 @@ def test_build_retries_and_preserves_current_and_hashed_assets(tmp_path):
     harness = r"""
 $global:FailBuild=$true
 $global:NpmCi=0
-function node { $global:LASTEXITCODE=0; if ($args -contains '--source-hash') { return 'new-source' } }
+function node { $global:LASTEXITCODE=0; if ($args -contains '--source-hash') { return 'new-source' }; if ($args -contains '--version') { return 'v24.0.0' } }
 function npm.cmd {
     $global:LASTEXITCODE=0
     if ($args[0] -eq 'ci') { $global:NpmCi++; return }
