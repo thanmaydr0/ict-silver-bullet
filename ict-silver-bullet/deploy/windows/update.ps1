@@ -10,6 +10,99 @@ $ExecutorPython = Join-Path $RepoRoot 'executor\.venv\Scripts\python.exe'
 $BrainPython = Join-Path $RepoRoot 'brain\.venv\Scripts\python.exe'
 $StopOrder = @('ICT-Brain', 'ICT-Executor', 'ICT-Watchdog', 'ICT-Equity', 'ICT-Candles', 'ICT-Dashboard', 'ICT-MT5Terminal')
 $StartOrder = @('ICT-MT5Terminal', 'ICT-Candles', 'ICT-Equity', 'ICT-Watchdog', 'ICT-Dashboard', 'ICT-Brain', 'ICT-Executor')
+$Modules = @{
+    'ICT-Brain' = @('brain', 'brain.app'); 'ICT-Dashboard' = @('brain', 'brain.dashboard')
+    'ICT-Candles' = @('executor', 'executor.mt5_bridge'); 'ICT-Executor' = @('executor', 'executor.order_executor')
+    'ICT-Equity' = @('executor', 'executor.trade_reporter'); 'ICT-Watchdog' = @('executor', 'executor.watchdog')
+}
+
+function Get-ModuleProcesses([string]$TaskName) {
+    $Spec = $Modules[$TaskName]
+    $Exe = Join-Path $RepoRoot "$($Spec[0])\.venv\Scripts\python.exe"
+    $Pattern = '(?:^|\s)-m\s+' + [regex]::Escape($Spec[1]) + '(?:\s|$)'
+    $Candidates = @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop |
+        Where-Object { $_.CommandLine -match $Pattern })
+    if (@($Candidates | Where-Object { -not $_.ExecutablePath -or -not $_.CreationDate }).Count -gt 0) {
+        throw "Cannot verify $TaskName process identity. Run from an elevated PowerShell."
+    }
+    # CPython may keep the venv executable as argv[0] in its base child, allowing
+    # identification even if the venv redirector has already exited.
+    $CommandPrefix = '^\s*(?:"' + [regex]::Escape($Exe) + '"|' + [regex]::Escape($Exe) + ')(?=\s|$)'
+    $Found = @($Candidates | Where-Object { $_.ExecutablePath -eq $Exe -or $_.CommandLine -match $CommandPrefix })
+    # A Windows venv redirects to a base interpreter. Include that child only
+    # when its module and parent chain match this checkout's venv interpreter.
+    do {
+        $Added = @($Candidates | Where-Object {
+            $Candidate = $_
+            $Found.ProcessId -notcontains $Candidate.ProcessId -and
+                @($Found | Where-Object { $_.ProcessId -eq $Candidate.ParentProcessId -and
+                    $_.CreationDate -le $Candidate.CreationDate }).Count -gt 0
+        })
+        $Found += $Added
+    } while ($Added.Count -gt 0)
+    return $Found
+}
+
+function Get-SameProcess($Snapshot) {
+    # Check creation time before using a PID: Windows may already have reused it.
+    $Current = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($Snapshot.ProcessId)" -ErrorAction Stop
+    if ($Current -and $Current.CreationDate -eq $Snapshot.CreationDate -and
+        $Current.ExecutablePath -eq $Snapshot.ExecutablePath -and $Current.CommandLine -eq $Snapshot.CommandLine) {
+        return $Current
+    }
+}
+
+function Stop-ModuleTask([string]$TaskName) {
+    # Snapshot before stopping the wrapper, while the venv parent chain is intact.
+    $Children = @(Get-ModuleProcesses $TaskName)
+    Stop-ScheduledTask -TaskName $TaskName
+    $Deadline = (Get-Date).AddSeconds(30)
+    while ((Get-ScheduledTask -TaskName $TaskName).State -eq 'Running') {
+        if ((Get-Date) -gt $Deadline) { throw "$TaskName did not stop; update aborted." }
+        Start-Sleep -Milliseconds 500
+    }
+    # NOTE: Scheduler can stop the PowerShell wrapper but leave hidden Python
+    # children alive. The full update reaches here only after its position guard.
+    # Never terminate arbitrary Python processes or the MT5 terminal.
+    foreach ($Child in $Children) {
+        $Current = Get-SameProcess $Child
+        if ($Current) {
+            Write-Host "Stopping surviving $TaskName Python PID $($Current.ProcessId)"
+            $Result = Invoke-CimMethod -InputObject $Current -MethodName Terminate -Arguments @{ Reason = 1 } -ErrorAction Stop
+            if ($Result.ReturnValue -ne 0 -and (Get-SameProcess $Child)) {
+                throw "Could not stop $TaskName Python PID $($Child.ProcessId). Update aborted."
+            }
+        }
+    }
+    do {
+        $Remaining = @(Get-ModuleProcesses $TaskName)
+        foreach ($Child in $Children) {
+            if (Get-SameProcess $Child) { $Remaining += $Child }
+        }
+        if ($Remaining.Count -eq 0) { break }
+        if ((Get-Date) -gt $Deadline) { throw "$TaskName still has Python processes. Update aborted." }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
+}
+
+function Start-ModuleTask([string]$TaskName) {
+    if (@(Get-ModuleProcesses $TaskName).Count -gt 0) { throw "$TaskName already has Python processes; refusing another copy." }
+    Start-ScheduledTask -TaskName $TaskName
+    $Deadline = (Get-Date).AddSeconds(15)
+    $RunningSince = $null
+    do {
+        Start-Sleep -Milliseconds 500
+        if ((Get-ScheduledTask -TaskName $TaskName).State -eq 'Running' -and
+            @(Get-ModuleProcesses $TaskName).Count -gt 0) {
+            if ($null -eq $RunningSince) { $RunningSince = Get-Date }
+            if (((Get-Date) - $RunningSince).TotalSeconds -ge 2) {
+                Write-Host "Started $TaskName"
+                return
+            }
+        } else { $RunningSince = $null }
+        if ((Get-Date) -gt $Deadline) { throw "$TaskName failed to start. Inspect task history and startup logs before retrying." }
+    } while ($true)
+}
 
 function Assert-NoOpenPositions {
     # Executed ONLY on EC2. Query both actual terminal positions and persisted
@@ -79,16 +172,11 @@ try {
         }
         Get-ScheduledTask -TaskName 'ICT-Dashboard' -ErrorAction Stop | Out-Null
         # Stop before advancing Python source; failure keeps trading tasks intact.
-        Stop-ScheduledTask -TaskName 'ICT-Dashboard'
-        $Deadline = (Get-Date).AddSeconds(30)
-        while ((Get-ScheduledTask -TaskName 'ICT-Dashboard').State -eq 'Running') {
-            if ((Get-Date) -gt $Deadline) { throw 'ICT-Dashboard did not stop.' }
-            Start-Sleep -Milliseconds 500
-        }
+        Stop-ModuleTask 'ICT-Dashboard'
         & git merge --ff-only origin/main
         if ($LASTEXITCODE -ne 0) { throw 'Dashboard-only fast-forward failed.' }
         & (Join-Path $DeployDir 'build_frontend.ps1')
-        Start-ScheduledTask -TaskName 'ICT-Dashboard'
+        Start-ModuleTask 'ICT-Dashboard'
         Write-Host 'Dashboard updated. Verify status.ps1 -Health; trading tasks were left running.'
         return
     }
@@ -102,13 +190,12 @@ try {
     $Before = @{}
     foreach ($File in $Requirements) { $Before[$File] = (Get-FileHash -LiteralPath $File -Algorithm SHA256).Hash }
     # Quiesce before changing source/dependencies. Stop producers before consumers.
-    foreach ($Name in $StopOrder | Where-Object { $_ -ne 'ICT-MT5Terminal' }) {
-        Stop-ScheduledTask -TaskName $Name
-        $Deadline = (Get-Date).AddSeconds(30)
-        while ((Get-ScheduledTask -TaskName $Name).State -eq 'Running') {
-            if ((Get-Date) -gt $Deadline) { throw "$Name did not stop; update aborted." }
-            Start-Sleep -Milliseconds 500
-        }
+    Stop-ModuleTask 'ICT-Brain'
+    # Check again after stopping the signal producer, before interrupting order
+    # management. A racing entry leaves Executor running for operator review.
+    if (-not $Force) { Assert-NoOpenPositions }
+    foreach ($Name in $StopOrder | Where-Object { $_ -notin @('ICT-Brain', 'ICT-MT5Terminal') }) {
+        Stop-ModuleTask $Name
     }
     # NOTE: Recheck after quiescing to catch an entry racing the first check.
     # If it fails, leave tasks stopped for operator review; never silently force.
@@ -154,11 +241,10 @@ try {
         if (-not (Get-Process -Name terminal64 -ErrorAction SilentlyContinue)) { throw 'MT5 did not start.' }
     }
     foreach ($Name in $StartOrder | Where-Object { $_ -ne 'ICT-MT5Terminal' }) {
-        Start-ScheduledTask -TaskName $Name
-        Write-Host "Started $Name"
+        Start-ModuleTask $Name
     }
-    Write-Host 'Update complete. Executor started last. Run status.ps1 and verify fresh equity/candles.'
+    Write-Host 'Update complete. Executor started last. Run status.ps1 -Health and verify fresh equity/candles.'
 } catch {
-    Write-Warning 'If tasks were stopped, they stay stopped after a failed update. Inspect logs/positions before recovery; do not blindly start Executor.'
+    Write-Warning 'Stopped tasks remain stopped after failure; surviving or already-started processes may still run. Inspect status.ps1 -History and positions before recovery; do not blindly start Executor.'
     throw
 } finally { Pop-Location }

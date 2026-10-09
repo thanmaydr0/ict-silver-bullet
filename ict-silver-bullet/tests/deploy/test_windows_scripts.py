@@ -7,6 +7,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import venv
 
 import pytest
@@ -296,7 +297,8 @@ def update_harness(tmp_path):
         shim = root / package / ".venv" / "Scripts" / "python.ps1"
         shim.parent.mkdir(parents=True)
         shim.write_text("if ($args -contains '-c') { $global:GuardCalls++; "
-                        "$global:LASTEXITCODE = if ($global:GuardCalls -gt 1 -and $null -ne $global:GuardNext) { $global:GuardNext } else { $global:GuardResult } } "
+                        "$global:LASTEXITCODE = if ($global:GuardResults.Count -ge $global:GuardCalls) { $global:GuardResults[$global:GuardCalls-1] } "
+                        "elseif ($global:GuardCalls -gt 1 -and $null -ne $global:GuardNext) { $global:GuardNext } else { $global:GuardResult } } "
                         "else { $global:PipCalls += $MyInvocation.MyCommand.Path; $global:LASTEXITCODE = $global:PipResult }",
                         encoding="utf-8")
     files = ["brain/requirements.txt", "brain/requirements-ml.txt", "backtest/requirements.txt", "executor/requirements.txt"]
@@ -309,6 +311,7 @@ $ErrorActionPreference='Stop'
 $global:GuardResult=0
 $global:GuardCalls=0
 $global:GuardNext=$null
+$global:GuardResults=@()
 $global:PipResult=0
 $global:PipCalls=@()
 $global:Stopped=@()
@@ -318,6 +321,14 @@ $global:ChangeRequirements=$false
 $global:BuildCalls=0
 $global:FailBuild=$false
 $global:ChangedFiles=@()
+$global:Processes=@()
+$global:Terminated=@()
+$global:RefuseTerminate=$false
+$global:FailedTask=$null
+$global:NextProcessId=1000
+$global:Clock=[datetime]'2026-10-09T10:00:00Z'
+function Get-Date { $global:Clock=$global:Clock.AddSeconds(1); return $global:Clock }
+function Start-Sleep { param($Milliseconds,$Seconds) }
 function git {
     $global:LASTEXITCODE=0
     if ($args[0] -eq 'branch') { return 'main' }
@@ -334,13 +345,34 @@ function git {
     }
 }
 function Get-ScheduledTask { param($TaskName,$ErrorAction)
-    return [pscustomobject]@{State='Ready';TaskName=$TaskName}
+    $State = if ($global:Started -contains $TaskName -and $TaskName -ne $global:FailedTask) { 'Running' } else { 'Ready' }
+    return [pscustomobject]@{State=$State;TaskName=$TaskName}
 }
 function Stop-ScheduledTask { param($TaskName)
     $global:Stopped += $TaskName
 }
 function Start-ScheduledTask { param($TaskName)
     $global:Started += $TaskName
+    if ($TaskName -eq $global:FailedTask) { return }
+    $Package = if ($TaskName -in @('ICT-Brain','ICT-Dashboard')) { 'brain' } else { 'executor' }
+    $Module = @{'ICT-Brain'='brain.app';'ICT-Dashboard'='brain.dashboard';'ICT-Candles'='executor.mt5_bridge';
+        'ICT-Executor'='executor.order_executor';'ICT-Equity'='executor.trade_reporter';'ICT-Watchdog'='executor.watchdog'}[$TaskName]
+    $global:NextProcessId++
+    $global:Processes += [pscustomobject]@{ProcessId=$global:NextProcessId;ParentProcessId=999;
+        ExecutablePath=(Join-Path (Get-Location) "$Package\.venv\Scripts\python.ps1");
+        CommandLine="python.exe -u -m $Module";CreationDate=$global:Clock}
+}
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
+    if ($Filter -match '^ProcessId = (\d+)$') { return @($global:Processes | Where-Object { $_.ProcessId -eq [int]$Matches[1] }) }
+    return $global:Processes
+}
+function Invoke-CimMethod { param($InputObject,$MethodName,$Arguments,$ErrorAction)
+    if ($Arguments.Reason -ne 1) { throw 'Termination must record interruption rather than a successful Python exit' }
+    if ($global:RefuseTerminate) { return [pscustomobject]@{ReturnValue=2} }
+    if ($MethodName -ne 'Terminate') { throw 'Unexpected CIM mutation' }
+    $global:Terminated += $InputObject.ProcessId
+    $global:Processes = @($global:Processes | Where-Object { $_.ProcessId -ne $InputObject.ProcessId })
+    return [pscustomobject]@{ReturnValue=0}
 }
 function Get-Process { param($Name,$ErrorAction)
     return [pscustomobject]@{Id=123;Name='terminal64'}
@@ -385,14 +417,26 @@ def test_update_retries_both_changed_venvs_after_failed_install(update_harness):
     assert not list((root / "logs").glob("*.requirements-pending"))
 
 
-def test_update_racing_entry_leaves_tasks_stopped(update_harness):
+def test_update_racing_entry_keeps_executor_running(update_harness):
     _, script, harness = update_harness
     output = ps(harness + "$global:GuardNext=2; "
                 f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
                 "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Stopped=$global:Stopped.Count;Started=$global:Started.Count;Pulls=$global:Pulls;Caught=$Caught;GuardCalls=$global:GuardCalls}))")
     result = json.loads(output.split("RESULT:")[-1])
     assert result["GuardCalls"] == 2
-    assert result["Stopped"] == 6
+    assert result["Stopped"] == 1  # Brain stopped; order management left intact.
+    assert result["Started"] == result["Pulls"] == 0
+    assert "Update aborted" in result["Caught"]
+
+
+def test_final_position_check_aborts_after_quiescing_before_git(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "$global:GuardResults=@(0,0,2); "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Stopped=$global:Stopped.Count;"
+                "Started=$global:Started.Count;Pulls=$global:Pulls;GuardCalls=$global:GuardCalls;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Stopped"] == 6 and result["GuardCalls"] == 3
     assert result["Started"] == result["Pulls"] == 0
     assert "Update aborted" in result["Caught"]
 
@@ -425,6 +469,172 @@ def test_downloaded_updater_uses_explicit_app_root(update_harness,tmp_path):
               "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Builds=$global:BuildCalls;Started=$global:Started}))")
     result=json.loads(output.split("RESULT:")[-1])
     assert result["Builds"] == 1 and result["Started"][-1] == "ICT-Executor"
+
+
+def orphan_processes(root):
+    """One real-shaped venv/base pair, plus unrelated interpreter and module."""
+    return (f"$global:Processes=@("
+            f"[pscustomobject]@{{ProcessId=11;ParentProcessId=10;ExecutablePath={quote(root / 'brain/.venv/Scripts/python.ps1')};"
+            "CommandLine='python.exe -u -m brain.dashboard';CreationDate=[datetime]'2026-10-09T06:00:00Z'},"
+            "[pscustomobject]@{ProcessId=12;ParentProcessId=11;ExecutablePath='C:\\Python311\\python.exe';"
+            "CommandLine='python.exe -u -m brain.dashboard';CreationDate=[datetime]'2026-10-09T06:00:01Z'},"
+            "[pscustomobject]@{ProcessId=22;ParentProcessId=21;ExecutablePath='C:\\other\\brain\\.venv\\Scripts\\python.exe';"
+            "CommandLine='python.exe -u -m brain.dashboard';CreationDate=[datetime]'2026-10-09T06:00:01Z'},"
+            "[pscustomobject]@{ProcessId=33;ParentProcessId=32;ExecutablePath='C:\\Python311\\python.exe';"
+            "CommandLine='python.exe -m unrelated';CreationDate=[datetime]'2026-10-09T06:00:01Z'}); ")
+
+
+def test_update_stops_surviving_venv_and_base_children_only(update_harness):
+    root, script, harness = update_harness
+    output = ps(harness + orphan_processes(root) + f"& {quote(script)} | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Terminated=$global:Terminated;"
+                "Remaining=@($global:Processes.ProcessId);Pulls=$global:Pulls;GuardCalls=$global:GuardCalls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Terminated"] == [11, 12]
+    assert 22 in result["Remaining"] and 33 in result["Remaining"]
+    assert result["Pulls"] == 1 and result["GuardCalls"] == 3
+
+
+def test_update_guard_failure_never_terminates_orphans(update_harness):
+    root, script, harness = update_harness
+    output = ps(harness + orphan_processes(root) + "$global:GuardResult=2; "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Terminated=$global:Terminated;"
+                "Stopped=$global:Stopped;Pulls=$global:Pulls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result == {"Terminated": [], "Stopped": [], "Pulls": 0}
+
+
+def test_unstoppable_child_aborts_before_git_or_build(update_harness):
+    root, script, harness = update_harness
+    output = ps(harness + orphan_processes(root) + "$global:RefuseTerminate=$true; "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Pulls=$global:Pulls;"
+                "Builds=$global:BuildCalls;Started=$global:Started;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Pulls"] == result["Builds"] == 0 and result["Started"] == []
+    assert "Could not stop ICT-Dashboard Python PID 11" in result["Caught"]
+
+
+def test_process_inspection_failure_aborts_before_stopping(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "function Get-CimInstance { throw 'Process inspection denied' }; "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Pulls=$global:Pulls;"
+                "Stopped=$global:Stopped;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Pulls"] == 0 and result["Stopped"] == []
+    assert "Process inspection denied" in result["Caught"]
+
+
+def test_reused_pid_is_not_terminated(update_harness):
+    root, script, harness = update_harness
+    inspection = r"""
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
+    if ($Filter -match '^ProcessId = (\d+)$') {
+        $Id = [int]$Matches[1]
+        if ($Id -eq 11) {
+            $Reused = $global:Processes | Where-Object { $_.ProcessId -eq 11 }
+            # Replace rather than mutate the object retained by the snapshot.
+            $global:Processes = @($global:Processes | Where-Object { $_.ProcessId -ne 11 })
+            $global:Processes += [pscustomobject]@{ProcessId=11;ParentProcessId=1;
+                ExecutablePath=$Reused.ExecutablePath;CommandLine='python.exe -m unrelated';CreationDate=$global:Clock}
+        }
+        return @($global:Processes | Where-Object { $_.ProcessId -eq $Id })
+    }
+    return $global:Processes
+}
+"""
+    output = ps(harness + orphan_processes(root) + inspection + f"& {quote(script)} | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Terminated=$global:Terminated;"
+                "Pulls=$global:Pulls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Terminated"] == [12] and result["Pulls"] == 1
+
+
+def test_detached_base_interpreter_is_scoped_by_original_venv_command(update_harness):
+    root, script, harness = update_harness
+    command = f'"{root / "brain/.venv/Scripts/python.ps1"}" -u -m brain.dashboard'
+    setup = (f"$global:Processes=@([pscustomobject]@{{ProcessId=12;ParentProcessId=11;ExecutablePath='C:\\Python311\\python.exe';"
+             f"CommandLine={quote(command)};CreationDate=$global:Clock}}); ")
+    output = ps(harness + setup + f"& {quote(script)} | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Terminated=$global:Terminated;Pulls=$global:Pulls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Terminated"] == [12] and result["Pulls"] == 1
+
+
+def test_invisible_process_identity_aborts_before_stopping(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "$global:Processes=@([pscustomobject]@{ProcessId=12;CommandLine='python -m brain.app';"
+                "ExecutablePath=$null;CreationDate=$global:Clock}); "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Stopped=$global:Stopped;Pulls=$global:Pulls;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Stopped"] == [] and result["Pulls"] == 0
+    assert "Cannot verify ICT-Brain process identity" in result["Caught"]
+
+
+def test_failed_dashboard_launch_does_not_start_brain_or_executor(update_harness):
+    _, script, harness = update_harness
+    output = ps(harness + "$global:FailedTask='ICT-Dashboard'; "
+                f"try {{ & {quote(script)} | Out-Null }} catch {{ $Caught=$_.Exception.Message }}; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Started=$global:Started;Caught=$Caught}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Started"] == ["ICT-Candles", "ICT-Equity", "ICT-Watchdog", "ICT-Dashboard"]
+    assert "ICT-Dashboard failed to start" in result["Caught"]
+    assert "Update complete" not in output
+
+
+def test_dashboard_only_cleans_dashboard_children_without_touching_executor(update_harness):
+    root, script, harness = update_harness
+    setup = orphan_processes(root) + (
+        f"$global:Processes += [pscustomobject]@{{ProcessId=44;ParentProcessId=43;ExecutablePath={quote(root / 'executor/.venv/Scripts/python.ps1')};"
+        "CommandLine='python.exe -m executor.order_executor';CreationDate=$global:Clock}; ")
+    output = ps(harness + setup + f"& {quote(script)} -DashboardOnly | Out-Null; "
+                "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Terminated=$global:Terminated;"
+                "Remaining=@($global:Processes.ProcessId);Started=$global:Started;Stopped=$global:Stopped;GuardCalls=$global:GuardCalls}))")
+    result = json.loads(output.split("RESULT:")[-1])
+    assert result["Terminated"] == [11, 12] and 44 in result["Remaining"]
+    assert result["Started"] == result["Stopped"] == ["ICT-Dashboard"]
+    assert result["GuardCalls"] == 0
+
+
+def test_real_windows_venv_children_stop_after_wrapper_is_ready(tmp_path):
+    # Exercise real CIM process identity and termination against ONLY this
+    # temporary, network-free module. Scheduler is mocked; no production code,
+    # SDK, configuration, credential files or service connections are loaded.
+    root = tmp_path / "harmless repo with spaces"
+    package = root / "brain"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "dashboard.py").write_text(
+        "from pathlib import Path\nimport time\n"
+        "Path(__file__).with_name('ready').touch()\ntime.sleep(12)\n", encoding="utf-8")
+    venv.EnvBuilder(with_pip=False).create(package / ".venv")
+    child = subprocess.Popen([str(package / ".venv/Scripts/python.exe"), "-u", "-m", "brain.dashboard"],
+                             cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+    try:
+        deadline = time.monotonic() + 5
+        while not (package / "ready").exists():
+            assert child.poll() is None, "Harmless fixture exited before ready"
+            assert time.monotonic() < deadline, "Harmless fixture did not start"
+            time.sleep(0.05)
+        source = (SCRIPTS / "update.ps1").read_text(encoding="utf-8")
+        helpers = "$Modules = @{" + source.split("$Modules = @{", 1)[1].split("function Assert-NoOpenPositions", 1)[0]
+        output = ps(f"$ErrorActionPreference='Stop'; $RepoRoot={quote(root)}; " + helpers +
+                    "function Get-ScheduledTask { param($TaskName) [pscustomobject]@{State='Ready'} }; "
+                    "function Stop-ScheduledTask { param($TaskName) }; "
+                    "$Before=@(Get-ModuleProcesses 'ICT-Dashboard'); Stop-ModuleTask 'ICT-Dashboard'; "
+                    "Write-Output ('RESULT:' + (ConvertTo-Json -Compress -InputObject @{Before=$Before.Count;"
+                    "After=@(Get-ModuleProcesses 'ICT-Dashboard').Count}))")
+        result = json.loads(output.split("RESULT:")[-1])
+        assert result["Before"] == 2 and result["After"] == 0
+        assert child.wait(timeout=3) != 0, "Fixture exited naturally rather than being terminated"
+    finally:
+        # Even on failure the harmless base interpreter exits after 12 seconds.
+        if child.poll() is None:
+            child.wait(timeout=20)
 
 
 def test_dashboard_only_never_restarts_trading_tasks(update_harness):

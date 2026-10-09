@@ -218,6 +218,25 @@ For later changes confined to dashboard code, frontend or its deployment/docs:
 .\deploy\windows\status.ps1 -Health
 ```
 
+The updater checks the Python processes as well as Task Scheduler state. Stopping
+a scheduled PowerShell wrapper can leave its hidden Python child alive, including
+the Windows venv redirector/base-interpreter pair. The updater captures those
+processes before stopping each wrapper and terminates surviving instances only
+when their module and checkout-specific venv identity match. It checks process
+creation times before termination to avoid acting on a reused PID. An inaccessible
+process identity or a child that cannot be stopped aborts the update before Git
+or dependency changes. Other checkout processes and `terminal64.exe` are preserved.
+
+For a full update the position guard runs before stopping anything, again after
+Brain is stopped but before stopping Executor, and after all six services stop.
+If an entry races the first check, Executor remains running for operator review.
+Each restart must show both a Running task and its Python process for at least
+two seconds; a startup failure stops the sequence before starting subsequent
+services. Earlier services may already be running. Use `status.ps1 -History -Health`
+after any failure and inspect positions before retrying. These startup checks
+verify process supervision; the health check and fresh data verify application
+readiness.
+
 This inspects incoming paths and refuses shared Python dependency, trading,
 configuration or other changes before stopping anything. It stops only
 ICT-Dashboard, fast-forwards, builds and restarts only ICT-Dashboard. Trading
@@ -240,6 +259,9 @@ dashboard stopped (and from the app directory):
 ```powershell
 Stop-ScheduledTask -TaskName 'ICT-Dashboard'
 if ((Get-ScheduledTask -TaskName 'ICT-Dashboard').State -eq 'Running') { throw 'Wait for dashboard to stop' }
+$DashboardChildren = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" |
+    Where-Object { $_.CommandLine -match '(?:^|\s)-m\s+brain\.dashboard(?:\s|$)' })
+if ($DashboardChildren.Count -gt 0) { throw 'Dashboard Python still running; use the updater to recover before moving bundles.' }
 if (-not (Test-Path -LiteralPath '.\frontend\dist.previous\build.json')) { throw 'No previous build' }
 if (Test-Path -LiteralPath '.\frontend\dist.failed') { throw 'Move or review the existing dist.failed first' }
 Move-Item -LiteralPath '.\frontend\dist' -Destination '.\frontend\dist.failed'
