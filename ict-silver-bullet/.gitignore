@@ -1,6 +1,7 @@
 .env
 brain/.env
 executor/.env
+executor/runtime/
 __pycache__/
 .venv/
 *.pyc
