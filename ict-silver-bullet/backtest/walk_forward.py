@@ -166,7 +166,7 @@ def day_cluster_expectancy(trades, *, samples=2000, seed=20261018):
 
 
 def momentum_walk_forward(rows, split, *, output_dir=None, config=None,
-                          min_tune_trades=100, min_tune_days=60, simulations=10000):
+                          min_tune_trades=100, min_tune_days=60, simulations=10000, data_provenance=None):
     """One fixed session-momentum hypothesis: no parameter search or live promotion."""
     config = config or ResearchConfig(spread_pips=.8)
     tune, later = split_history(rows, split)
@@ -179,7 +179,8 @@ def momentum_walk_forward(rows, split, *, output_dir=None, config=None,
         protection="fixed opposite-band hard stop; unchanged account breakers and four-trade/day cap",
         config=asdict(config), min_tune_trades=min_tune_trades, min_tune_days=min_tune_days,
         source="Zarattini/Aziz/Barbon 2025 revision, SPY: unverified FX adaptation, TWAP substitutes for VWAP",
-        data_status="retrospective research; historical broker clock offsets not independently verified",
+        data_status="retrospective research; inspect data provenance for clock and quote basis",
+        data_provenance=data_provenance or dict(clock="not independently verified"),
         prior_trials="ICT thresholds, fixed-2R, breakout pullback, failed breakout, stop cascade and trend reclaim",
         news_policy="skipped; historical news unavailable", llm_policy="mechanical bypass",
         live_eligible=False, execution_parity="not compatible with current two-leg live executor; no live adapter activated")
@@ -200,7 +201,8 @@ def momentum_walk_forward(rows, split, *, output_dir=None, config=None,
     if eligible:
         for name, settings in (("validation", config), ("stress", replace(config,
                 spread_pips=2*config.spread_pips, slippage_pips=2*config.slippage_pips,
-                commission_per_lot=2*config.commission_per_lot))):
+                commission_per_lot=2*config.commission_per_lot,
+                historical_spread_multiplier=2*config.historical_spread_multiplier))):
             report = session_momentum_replay(CandleHistory(tune+later), decision_start=split,
                 config=settings, results_path=output/f"{name}.jsonl" if output else None)
             if output:

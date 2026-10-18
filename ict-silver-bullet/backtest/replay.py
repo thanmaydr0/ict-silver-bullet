@@ -36,6 +36,7 @@ class ResearchConfig:
     max_hold_minutes: int = 20
     max_entry_deviation_pips: float = 2.0
     monthly_target: float = 0.10
+    historical_spread_multiplier: float = 1.0
 
     def __post_init__(self):
         values = asdict(self)
@@ -43,6 +44,7 @@ class ResearchConfig:
             raise ValueError("research assumptions must be finite numbers")
         if not (0 < self.risk_pct <= .005 and 0 < self.reward_r <= 5 and
                 0 < self.max_cost_r <= 1 and self.monthly_target > 0 and
+                self.historical_spread_multiplier >= 1 and
                 isinstance(self.max_hold_minutes, int) and self.max_hold_minutes > 0):
             raise ValueError("invalid research risk, reward, cost cap or holding time")
         if min(self.spread_pips, self.slippage_pips, self.commission_per_lot,
@@ -676,6 +678,29 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
             output.close()
 
 
+def ask_quotes(row, config):
+    """Historical Ask OHLC when available, otherwise an explicit fixed spread.
+
+    Stress adds an extra opening spread to every Ask field, determined at the
+    bar's open; it never uses the future closing spread to decide an entry.
+    """
+    fields = ("open", "high", "low", "close")
+    present = ["ask_"+field in row for field in fields]
+    if any(present) and not all(present):
+        raise ValueError("partial historical Ask candle")
+    if all(present):
+        result = {field: float(row["ask_"+field]) for field in fields}
+        if (not all(math.isfinite(v) for v in result.values()) or
+                not result["low"] <= min(result["open"], result["close"]) <= max(
+                    result["open"], result["close"]) <= result["high"] or
+                any(result[field]+1e-10 < row[field] for field in fields)):
+            raise ValueError("invalid historical Ask candle")
+        extra = (config.historical_spread_multiplier-1)*(result["open"]-row["open"])
+        return {field: price+extra for field, price in result.items()}
+    spread = config.spread_pips*pair_spec(row["pair"], row["open"])["pip_size"]
+    return {field: row[field]+spread for field in fields}
+
+
 def session_momentum_replay(rows, *, config=None, initial_equity=10000., decision_start=None,
                             decision_end=None, results_path=None):
     """One frozen FX session-momentum candidate, using the actual core chain.
@@ -713,11 +738,11 @@ def session_momentum_replay(rows, *, config=None, initial_equity=10000., decisio
         if output:
             output.write(json.dumps(record, default=_json)+"\n")
 
-    def equity(bid=None):
+    def equity(quote=None):
         if position is None:
             return balance
-        quote = prices[position["pair"]] if bid is None else bid
-        quote += position["spread"] if position["direction"] == "sell" else 0
+        if quote is None:
+            quote = prices[position["pair"]]["ask" if position["direction"] == "sell" else "bid"]
         return balance+(quote-position["entry"])*position["sign"]*position["unit"]
 
     def close(quote, when, why):
@@ -746,6 +771,7 @@ def session_momentum_replay(rows, *, config=None, initial_equity=10000., decisio
             if end and now >= end:
                 break
             model = models[pair]
+            ask = ask_quotes(row, config)
             model.observe(row)
             bars[pair].append(row)
             if start and now < start:
@@ -758,11 +784,11 @@ def session_momentum_replay(rows, *, config=None, initial_equity=10000., decisio
                 sign = 1 if request["direction"] == "buy" else -1
                 spec = pair_spec(pair, row["open"])
                 pip = spec["pip_size"]
-                spread = config.spread_pips*pip
-                fill = row["open"]+(spread if sign == 1 else 0)+sign*config.slippage_pips*pip
+                spread = ask["open"]-row["open"]
+                fill = (ask["open"] if sign == 1 else row["open"])+sign*config.slippage_pips*pip
                 distance = sign*(fill-request["stop_loss"])
-                cost = (config.spread_pips+2*config.slippage_pips+
-                        config.commission_per_lot/spec["pip_value_per_lot"])*pip
+                cost = spread+(2*config.slippage_pips+
+                               config.commission_per_lot/spec["pip_value_per_lot"])*pip
                 reason = None
                 if request["detected_at"] != row["ts"]:
                     reason = "missing_next_bar"
@@ -798,29 +824,28 @@ def session_momentum_replay(rows, *, config=None, initial_equity=10000., decisio
                         close_at=session_momentum.bounds(request["killzone"], row["ts"])[1])
                     counts += 1
                     emit(dict(type="fill", **position))
-            prices[pair] = row["close"]
+            prices[pair] = dict(bid=row["close"], ask=ask["close"])
             profile = model.snapshot(now)
             if position and position["pair"] == pair:
                 buy = position["direction"] == "buy"
-                spread = 0 if buy else position["spread"]
-                stopped = row["low"] <= position["stop_loss"] if buy else row["high"]+spread >= position["stop_loss"]
+                stopped = row["low"] <= position["stop_loss"] if buy else ask["high"] >= position["stop_loss"]
                 if stopped:
                     quote = min(row["open"], position["stop_loss"]) if buy else max(
-                        row["open"]+spread, position["stop_loss"])
+                        ask["open"], position["stop_loss"])
                     close(quote, now, "hard_stop")
                 else:
-                    adverse = row["low"] if buy else row["high"]
+                    adverse = row["low"] if buy else ask["high"]
                     state.update(equity(adverse), balance, row["ts"])
                     maximum = max(maximum, state.overall_dd_pct)
                     breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
                     if "hard_daily" in breakers or "hard_overall" in breakers:
                         halted |= "hard_overall" in breakers
                         daily_halt = trading_day_start(row["ts"])
-                        close(adverse+spread, now, "circuit_breaker_bar_bound")
+                        close(adverse, now, "circuit_breaker_bar_bound")
                     else:
                         why = session_momentum.exit_reason(position, profile, now)
                         if why:
-                            close(row["close"]+spread, now, why)
+                            close(row["close"] if buy else ask["close"], now, why)
             state.update(equity(), balance, row["ts"])
             maximum = max(maximum, state.overall_dd_pct)
             breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
@@ -851,7 +876,8 @@ def session_momentum_replay(rows, *, config=None, initial_equity=10000., decisio
         report = dict(strategy=session_momentum.STRATEGY, live_eligible=False, research_only=True,
             decision_model="shared brain.app.evaluate_candles; shared pure session entry/exit policy",
             execution_model="one position; next-open Bid/Ask; fixed protective stop; half-hour band/TWAP exit; no fixed TP; session close; adverse OHLC bounds",
-            data_limits="M1 Bid bars; assumed fixed friction; historical clock offsets not independently verified",
+            data_limits="M1 OHLC cannot establish tick order; fees/slippage assumed; inspect source clock/quote provenance",
+            quote_policy="historical matched Ask OHLC when supplied; otherwise fixed-spread assumption; fees/slippage assumed",
             news_policy="skipped: historical calendar unavailable", llm_policy="mechanical bypass",
             config=asdict(config), target_policy="no fixed R take-profit; config.reward_r and max_hold_minutes unused",
             initial_equity=initial_equity, balance=balance, equity=equity(), metrics=metrics(trades),
