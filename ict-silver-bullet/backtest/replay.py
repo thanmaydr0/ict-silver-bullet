@@ -27,7 +27,17 @@ def timestamp(value):
     return value.astimezone(timezone.utc)
 
 
+class CandleHistory(tuple):
+    """Already normalized candles; replay reads rows without mutating them.
+
+    Internal callers may share this sequence across passes without copying
+    millions of row dictionaries. Construct via normalize_history externally.
+    """
+
+
 def normalize_history(rows):
+    if isinstance(rows, CandleHistory):
+        return rows
     unique = {}
     for raw in rows:
         row = dict(raw, ts=timestamp(raw["ts"]))
@@ -44,7 +54,7 @@ def normalize_history(rows):
         if key in unique and unique[key] != row:
             raise ValueError("conflicting duplicate candle")
         unique[key] = row
-    return sorted(unique.values(), key=lambda c: (c["ts"], c["pair"], c["timeframe"]))
+    return CandleHistory(sorted(unique.values(), key=lambda c: (c["ts"], c["pair"], c["timeframe"])))
 
 
 def load_history(data_dir):

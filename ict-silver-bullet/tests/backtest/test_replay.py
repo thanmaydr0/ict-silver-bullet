@@ -128,4 +128,14 @@ def test_parquet_loader_reads_phase_one_shape(tmp_path):
     pytest.importorskip("pyarrow")
     pd.DataFrame(candles()).to_parquet(tmp_path / "EURUSD_M1.parquet", index=False)
     loaded = module.load_history(tmp_path)
-    assert loaded == candles()
+    assert list(loaded) == candles()
+
+
+def test_normalized_history_reused_without_mutation():
+    raw = candles()
+    prepared = module.normalize_history(raw)
+    assert module.normalize_history(prepared) is prepared
+    before = [dict(row) for row in prepared]
+    module.replay(prepared, collect_decisions=False)
+    assert list(prepared) == before
+    assert raw == candles()

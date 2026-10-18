@@ -7,7 +7,7 @@ import argparse
 from datetime import timedelta
 from pathlib import Path
 
-from backtest.replay import load_history, normalize_history, replay, timestamp, write_report
+from backtest.replay import CandleHistory, load_history, normalize_history, replay, timestamp, write_report
 from brain.logging_setup import setup_logging
 
 
@@ -22,7 +22,7 @@ def split_history(rows, split):
     for row in normalize_history(rows):
         available = row["ts"] + timedelta(minutes=1 if row["timeframe"] == "M1" else 60)
         (tune if available < boundary else validate).append(row)
-    return tune, validate
+    return CandleHistory(tune), CandleHistory(validate)
 
 
 def walk_forward(rows, split, *, thresholds=(7, 8, 9, 10), output_dir=None,
@@ -51,7 +51,7 @@ def walk_forward(rows, split, *, thresholds=(7, 8, 9, 10), output_dir=None,
                       validation=None, reason="no_closed_tune_trades", news_policy="skipped")
     else:
         chosen = max(eligible, key=lambda r: (r["expectancy_r"], r["effective_threshold"], r["threshold"]))
-        validation = replay(tune + validate, threshold=chosen["threshold"],
+        validation = replay(CandleHistory(tune + validate), threshold=chosen["threshold"],
                             decision_start=split, llm=llm, review_setup=review_setup, collect_decisions=False,
                             results_path=output / "validate.jsonl" if output else None)
         result = dict(split=timestamp(split), sweep=sweep, chosen_threshold=chosen["threshold"],
