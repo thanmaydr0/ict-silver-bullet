@@ -8,7 +8,7 @@ import time
 
 from brain.config import load_config
 from brain.db import supabase_client as db
-from brain.detection import fvg, liquidity, mss, order_block, ote, swings, trend_reclaim
+from brain.detection import fvg, liquidity, mss, order_block, ote, swings, trend_reclaim, session_momentum
 from brain.llm import reasoning
 from brain.logging_setup import setup_logging
 from brain.news import blackout
@@ -75,6 +75,8 @@ def _ema(values, period):
 
 def _detect_candidate(candles, context):
     strategy = context.get("strategy", trend_reclaim.STRATEGY)
+    if strategy == session_momentum.STRATEGY:
+        return session_momentum.detect(candles, context)
     if strategy == "ict":
         return _detect_ict_candidate(candles, context)
     if strategy != trend_reclaim.STRATEGY:
@@ -188,7 +190,9 @@ def evaluate_candles(candles, context) -> PipelineDecision:
         return PipelineDecision(signal is not None, reason, setup, score, llm, risk,
                                 signal, tuple(stages))
 
-    zone = context.get("current_killzone", killzone_clock.current_killzone)(now)
+    clock = (session_momentum.session_at if context.get("strategy") == session_momentum.STRATEGY
+             else killzone_clock.current_killzone)
+    zone = context.get("current_killzone", clock)(now)
     stage(f"killzone: {zone}")
     if zone is None:
         return finish("outside_killzone")
@@ -248,6 +252,8 @@ def evaluate_candles(candles, context) -> PipelineDecision:
     account = dict(equity=state["equity"], pair=context["pair"], direction=setup["direction"],
         stop_loss_pips=abs(setup["entry"] - setup["stop_loss"]) / spec["pip_size"],
         pip_value_per_lot=spec["pip_value_per_lot"])
+    if setup.get("strategy") == session_momentum.STRATEGY:
+        account["session_policy"] = session_momentum.STRATEGY
     stage(f"risk inputs: account={account} trades={state['trades_today']} "
           f"loss_streak={state['consecutive_losses_today']} positions={state['open_positions']} "
           f"drawdown={state['drawdown_state']}")

@@ -20,6 +20,7 @@ from brain.risk import engine
 from brain.risk.position_sizing import DEFAULT_RISK_PCT
 from brain.risk.circuit_breakers import DrawdownState, check_breakers, trading_day_start
 from brain.scheduler.killzone_clock import current_killzone, killzone_close
+from brain.detection import session_momentum
 
 
 @dataclass(frozen=True)
@@ -675,6 +676,195 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
             output.close()
 
 
+def session_momentum_replay(rows, *, config=None, initial_equity=10000., decision_start=None,
+                            decision_end=None, results_path=None):
+    """One frozen FX session-momentum candidate, using the actual core chain.
+
+    No fixed TP or runner. Opposite-band broker stop plus half-hour band/TWAP
+    exits and session-end liquidation. M1 Bid bars imply uncertain intrabar
+    paths; stops and adverse equity bounds take priority. News/LLM are bypassed.
+    """
+    config = config or ResearchConfig()
+    if not math.isfinite(initial_equity) or initial_equity <= 0:
+        raise ValueError("positive initial equity required")
+    start = timestamp(decision_start) if decision_start else None
+    end = timestamp(decision_end) if decision_end else None
+    if start and end and end <= start:
+        raise ValueError("decision_end must follow decision_start")
+    history = normalize_history(rows)
+    models = defaultdict(session_momentum.SessionHistory)
+    bars = defaultdict(lambda: deque(maxlen=60))
+    balance = initial_equity
+    state = DrawdownState(balance, balance)
+    position = pending = None
+    prices, monthly, reasons = {}, {}, Counter()
+    trades = []
+    counts = losses = 0
+    halted = False
+    daily_halt = None
+    maximum = 0.
+    output = None
+    if results_path:
+        path = Path(results_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output = path.open("w", encoding="utf-8")
+
+    def emit(record):
+        if output:
+            output.write(json.dumps(record, default=_json)+"\n")
+
+    def equity(bid=None):
+        if position is None:
+            return balance
+        quote = prices[position["pair"]] if bid is None else bid
+        quote += position["spread"] if position["direction"] == "sell" else 0
+        return balance+(quote-position["entry"])*position["sign"]*position["unit"]
+
+    def close(quote, when, why):
+        nonlocal position, balance, losses
+        fill = quote-position["sign"]*config.slippage_pips*position["pip"]
+        gross = (fill-position["entry"])*position["sign"]*position["unit"]
+        exit_fee = config.commission_per_lot*position["lot_size"]/2
+        balance += gross-exit_fee
+        net = gross-exit_fee-position["entry_fee"]
+        trade = dict(position, exit=fill, closed_at=when, exit_reason=why, pnl=net,
+                     gross_pnl=gross, commission=exit_fee+position["entry_fee"],
+                     r_multiple=net/position["risk_usd"])
+        trades.append(trade)
+        emit(dict(type="trade", **trade))
+        losses = losses+1 if net < 0 else 0
+        position = None
+
+    def configured_risk(score, dd, account, *args):
+        return engine.evaluate_signal(score, dd, dict(account, risk_pct=config.risk_pct), *args)
+
+    try:
+        for row in history:
+            if row["timeframe"] != "M1":
+                continue
+            pair, now = row["pair"], row["ts"]+timedelta(minutes=1)
+            if end and now >= end:
+                break
+            model = models[pair]
+            model.observe(row)
+            bars[pair].append(row)
+            if start and now < start:
+                continue
+            if state.day_start != trading_day_start(row["ts"]):
+                counts = losses = 0
+            state.update(equity(), balance, row["ts"])
+            if pending and pending["pair"] == pair:
+                request, pending = pending, None
+                sign = 1 if request["direction"] == "buy" else -1
+                spec = pair_spec(pair, row["open"])
+                pip = spec["pip_size"]
+                spread = config.spread_pips*pip
+                fill = row["open"]+(spread if sign == 1 else 0)+sign*config.slippage_pips*pip
+                distance = sign*(fill-request["stop_loss"])
+                cost = (config.spread_pips+2*config.slippage_pips+
+                        config.commission_per_lot/spec["pip_value_per_lot"])*pip
+                reason = None
+                if request["detected_at"] != row["ts"]:
+                    reason = "missing_next_bar"
+                elif position or halted or daily_halt == trading_day_start(row["ts"]):
+                    reason = "account_unavailable"
+                elif distance <= 0:
+                    reason = "invalid_stop_after_fill"
+                elif abs(fill-request["entry"])/pip > config.max_entry_deviation_pips:
+                    reason = "entry_moved"
+                elif cost/distance > config.max_cost_r:
+                    reason = "cost_exceeds_budget"
+                if not reason:
+                    risk = configured_risk(dict(score=request["confluence_score"], reason=None), state,
+                        dict(equity=equity(), pair=pair, direction=request["direction"],
+                             session_policy=session_momentum.STRATEGY,
+                             stop_loss_pips=distance/pip+config.slippage_pips+
+                                 config.commission_per_lot/spec["pip_value_per_lot"],
+                             pip_value_per_lot=spec["pip_value_per_lot"]),
+                        [], counts, losses, row["ts"])
+                    if not risk["approved"]:
+                        reason = risk["reason"]
+                if reason:
+                    reasons[reason] += 1
+                    emit(dict(type="rejection", now=row["ts"], reason=reason, setup=request))
+                else:
+                    lots = risk["lot_size"]
+                    unit = lots*spec["pip_value_per_lot"]/pip
+                    fee = config.commission_per_lot*lots/2
+                    balance -= fee
+                    position = dict(request, entry=fill, lot_size=lots, unit=unit, pip=pip,
+                        sign=sign, spread=spread, entry_fee=fee, risk_usd=distance*unit,
+                        opened_at=row["ts"], session=request["killzone"],
+                        close_at=session_momentum.bounds(request["killzone"], row["ts"])[1])
+                    counts += 1
+                    emit(dict(type="fill", **position))
+            prices[pair] = row["close"]
+            profile = model.snapshot(now)
+            if position and position["pair"] == pair:
+                buy = position["direction"] == "buy"
+                spread = 0 if buy else position["spread"]
+                stopped = row["low"] <= position["stop_loss"] if buy else row["high"]+spread >= position["stop_loss"]
+                if stopped:
+                    quote = min(row["open"], position["stop_loss"]) if buy else max(
+                        row["open"]+spread, position["stop_loss"])
+                    close(quote, now, "hard_stop")
+                else:
+                    adverse = row["low"] if buy else row["high"]
+                    state.update(equity(adverse), balance, row["ts"])
+                    maximum = max(maximum, state.overall_dd_pct)
+                    breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
+                    if "hard_daily" in breakers or "hard_overall" in breakers:
+                        halted |= "hard_overall" in breakers
+                        daily_halt = trading_day_start(row["ts"])
+                        close(adverse+spread, now, "circuit_breaker_bar_bound")
+                    else:
+                        why = session_momentum.exit_reason(position, profile, now)
+                        if why:
+                            close(row["close"]+spread, now, why)
+            state.update(equity(), balance, row["ts"])
+            maximum = max(maximum, state.overall_dd_pct)
+            breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
+            if "hard_daily" in breakers or "hard_overall" in breakers:
+                halted |= "hard_overall" in breakers
+                daily_halt = trading_day_start(row["ts"])
+                pending = None
+            monthly[now.strftime("%Y-%m")] = equity()
+            if profile is None:
+                continue
+            decision = app.evaluate_candles(list(bars[pair]), dict(now=now, pair=pair,
+                strategy=session_momentum.STRATEGY, session_profile=profile, htf_candles=[],
+                news_events=[], evaluate_signal=configured_risk,
+                review_setup=lambda _: dict(verdict="approve", conviction=1., reasoning="Mechanical-only research"),
+                risk_state=dict(equity=equity(), drawdown_state=state, trades_today=counts+(pending is not None),
+                    consecutive_losses_today=losses, open_positions=[position] if position else [])))
+            reasons[decision.reason] += 1
+            execution = "discarded"
+            if decision.approved:
+                if not position and not pending and not halted and daily_halt != trading_day_start(row["ts"]):
+                    pending = dict(decision.signal)
+                    execution = "pending_next_open"
+                else:
+                    execution = "position_or_halt_exists"
+            if decision.setup is not None:
+                emit(dict(type="decision", now=now, pair=pair, profile=profile,
+                          candles=list(bars[pair]), decision=asdict(decision), execution=execution))
+        report = dict(strategy=session_momentum.STRATEGY, live_eligible=False, research_only=True,
+            decision_model="shared brain.app.evaluate_candles; shared pure session entry/exit policy",
+            execution_model="one position; next-open Bid/Ask; fixed protective stop; half-hour band/TWAP exit; no fixed TP; session close; adverse OHLC bounds",
+            data_limits="M1 Bid bars; assumed fixed friction; historical clock offsets not independently verified",
+            news_policy="skipped: historical calendar unavailable", llm_policy="mechanical bypass",
+            config=asdict(config), target_policy="no fixed R take-profit; config.reward_r and max_hold_minutes unused",
+            initial_equity=initial_equity, balance=balance, equity=equity(), metrics=metrics(trades),
+            trades=trades, reasons=dict(reasons), max_drawdown_pct=100*maximum, halted=halted,
+            open_position=position, pending=pending,
+            monthly=monthly_statistics(monthly, initial_equity, config.monthly_target))
+        emit(dict(type="report", **{k: v for k, v in report.items() if k != "trades"}))
+        return report
+    finally:
+        if output:
+            output.close()
+
+
 def replay(rows, *, threshold=8, initial_equity=10000.0, llm=False,
            review_setup=None, results_path=None, decision_start=None, decision_end=None,
            collect_decisions=True):
@@ -864,7 +1054,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument("--llm", action="store_true")
-    parser.add_argument("--research", choices=("core", "ict_2r", "breakout_pullback", "failed_breakout", "stop_cascade_continuation"))
+    parser.add_argument("--research", choices=("session_momentum", "core", "ict_2r", "breakout_pullback", "failed_breakout", "stop_cascade_continuation"))
     parser.add_argument("--reward-r", type=float, default=2.)
     parser.add_argument("--risk-pct", type=float, default=DEFAULT_RISK_PCT)
     parser.add_argument("--spread-pips", type=float, default=.5)
@@ -879,8 +1069,12 @@ def main():
         config = ResearchConfig(reward_r=args.reward_r, risk_pct=args.risk_pct,
                                 spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
                                 commission_per_lot=args.commission_per_lot)
-        report = research_replay(rows, strategy=args.research, config=config,
-                                 results_path=args.output_dir / "research.jsonl", threshold=args.threshold)
+        if args.research == "session_momentum":
+            report = session_momentum_replay(rows, config=config,
+                                            results_path=args.output_dir / "research.jsonl")
+        else:
+            report = research_replay(rows, strategy=args.research, config=config,
+                                     results_path=args.output_dir / "research.jsonl", threshold=args.threshold)
         write_report(args.output_dir / "research.json", report)
         logger.info("Research screening only: metrics=%s monthly=%s", report["metrics"], report["monthly"])
         return

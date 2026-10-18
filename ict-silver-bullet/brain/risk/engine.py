@@ -5,6 +5,7 @@ from datetime import time
 from brain.risk.circuit_breakers import NEW_YORK, check_breakers
 from brain.risk.position_sizing import DEFAULT_RISK_PCT, calculate_lot_size
 from brain.scheduler.killzone_clock import current_killzone
+from brain.detection.session_momentum import session_at
 
 FRIDAY_CLOSE = time(17)
 FRIDAY_GAP_GUARD_START = time(16, 50)
@@ -65,7 +66,11 @@ def evaluate_signal(setup_score_result, drawdown_state, account_state, open_posi
     local = now.astimezone(NEW_YORK)
     if local.weekday() == 4 and FRIDAY_GAP_GUARD_START <= local.time():
         return reject("friday_close_guard")
-    if current_killzone(now) is None:
+    policy = account_state.get("session_policy", "legacy")
+    if policy not in {"legacy", "session_momentum"}:
+        return reject("unknown_session_policy")
+    clock = session_at if policy == "session_momentum" else current_killzone
+    if clock(now) is None:
         return reject("outside_killzone")
     if setup_score_result.get("reason"):
         return reject(setup_score_result["reason"])

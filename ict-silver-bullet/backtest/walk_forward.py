@@ -7,10 +7,12 @@ import argparse
 from dataclasses import asdict, replace
 from datetime import timedelta
 import math
+import random
 from pathlib import Path
 
 from backtest.replay import (CandleHistory, ResearchConfig, load_history, normalize_history,
-                             replay, research_replay, timestamp, write_report)
+                             replay, research_replay, session_momentum_replay, timestamp, write_report)
+from brain.risk.circuit_breakers import trading_day_start
 from brain.logging_setup import setup_logging
 
 
@@ -137,6 +139,85 @@ def core_walk_forward(rows, split, *, output_dir=None, config=None,
     return result
 
 
+def day_cluster_expectancy(trades, *, samples=2000, seed=20261018):
+    """Exploratory day-block interval, preserving same-day outcome dependence.
+
+    This is not a multiple-testing correction and cannot make reused history a
+    fresh holdout. Whole observed trading days are sampled with replacement.
+    """
+    if samples < 1:
+        raise ValueError("positive bootstrap count required")
+    groups = {}
+    for trade in trades:
+        day = trading_day_start(timestamp(trade["opened_at"]))
+        total, count = groups.get(day, (0., 0))
+        groups[day] = (total+trade["r_multiple"], count+1)
+    if not groups:
+        return dict(trading_days=0, lower_95_r=None, upper_95_r=None)
+    blocks = list(groups.values())
+    rng = random.Random(seed)
+    means = []
+    for _ in range(samples):
+        draw = rng.choices(blocks, k=len(blocks))
+        means.append(sum(r for r, _ in draw)/sum(n for _, n in draw))
+    means.sort()
+    return dict(trading_days=len(groups), lower_95_r=means[int(.025*(samples-1))],
+                upper_95_r=means[int(.975*(samples-1))], samples=samples, seed=seed)
+
+
+def momentum_walk_forward(rows, split, *, output_dir=None, config=None,
+                          min_tune_trades=100, min_tune_days=60, simulations=10000):
+    """One fixed session-momentum hypothesis: no parameter search or live promotion."""
+    config = config or ResearchConfig(spread_pips=.8)
+    tune, later = split_history(rows, split)
+    if not tune or not later or min(min_tune_trades, min_tune_days, simulations) < 1:
+        raise ValueError("nonempty periods and positive evidence floors required")
+    output = Path(output_dir) if output_dir else None
+    spec = dict(strategy="session_momentum", split=timestamp(split), lookback_sessions=14,
+        decision_frequency_minutes=30, sessions="08:00..12:00 London and New York local; weekdays",
+        exit_policy="no fixed TP; current band/TWAP loss at half-hour checkpoints or session close",
+        protection="fixed opposite-band hard stop; unchanged account breakers and four-trade/day cap",
+        config=asdict(config), min_tune_trades=min_tune_trades, min_tune_days=min_tune_days,
+        source="Zarattini/Aziz/Barbon 2025 revision, SPY: unverified FX adaptation, TWAP substitutes for VWAP",
+        data_status="retrospective research; historical broker clock offsets not independently verified",
+        prior_trials="ICT thresholds, fixed-2R, breakout pullback, failed breakout, stop cascade and trend reclaim",
+        news_policy="skipped; historical news unavailable", llm_policy="mechanical bypass",
+        live_eligible=False, execution_parity="not compatible with current two-leg live executor; no live adapter activated")
+    if output:
+        write_report(output/"frozen_specification.json", spec)
+    tune_report = session_momentum_replay(tune, config=config,
+        results_path=output/"tune.jsonl" if output else None)
+    interval = day_cluster_expectancy(tune_report["trades"])
+    if output:
+        write_report(output/"tune.json", tune_report)
+    eligible = (tune_report["metrics"]["trades"] >= min_tune_trades
+        and interval["trading_days"] >= min_tune_days and interval["lower_95_r"] > 0
+        and not tune_report["halted"])
+    result = dict(specification=spec, tune={k:v for k,v in tune_report.items() if k != "trades"},
+        tune_interval=interval, validation=None, stress=None, monte_carlo=None,
+        qualified_for_later_period=eligible, live_eligible=False,
+        reason="insufficient_positive_cost_adjusted_tune_evidence")
+    if eligible:
+        for name, settings in (("validation", config), ("stress", replace(config,
+                spread_pips=2*config.spread_pips, slippage_pips=2*config.slippage_pips,
+                commission_per_lot=2*config.commission_per_lot))):
+            report = session_momentum_replay(CandleHistory(tune+later), decision_start=split,
+                config=settings, results_path=output/f"{name}.jsonl" if output else None)
+            if output:
+                write_report(output/f"{name}.json", report)
+            result[name] = {k:v for k,v in report.items() if k != "trades"}
+            if name == "validation" and report["trades"]:
+                from backtest.monte_carlo import simulate
+                result["monte_carlo"] = simulate(report["trades"], simulations=simulations,
+                                                 risk_pct=config.risk_pct, seed=20261018)
+                if output:
+                    write_report(output/"monte_carlo.json", result["monte_carlo"])
+        result["reason"] = "retrospective_diagnostics_only; verified ticks, execution adapter and fresh forward test required"
+    if output:
+        write_report(output/"summary.json", result)
+    return result
+
+
 def screen_research(rows, split, *, output_dir=None, config=None, min_tune_trades=100,
                     min_complete_months=6, candidate_providers=None):
     """Five declared hypotheses, no tuning on later candles, no live promotion.
@@ -201,6 +282,7 @@ def main():
     parser.add_argument("--llm", action="store_true")
     parser.add_argument("--research", action="store_true")
     parser.add_argument("--core", action="store_true", help="cost-aware shared-core experiment")
+    parser.add_argument("--session-momentum", action="store_true", help="single frozen session/noise-band candidate")
     parser.add_argument("--risk-pct", type=float, default=.0025)
     parser.add_argument("--spread-pips", type=float, default=.5)
     parser.add_argument("--slippage-pips", type=float, default=.1)
@@ -208,6 +290,14 @@ def main():
     args = parser.parse_args()
     logger = setup_logging("walk_forward")
     rows = load_history(args.data_dir)
+    if args.session_momentum:
+        if args.core or args.research or args.llm:
+            parser.error("--session-momentum is a separate mechanical experiment")
+        result = momentum_walk_forward(rows, args.split, output_dir=args.output_dir/"session_momentum",
+            config=ResearchConfig(risk_pct=args.risk_pct, spread_pips=args.spread_pips,
+                slippage_pips=args.slippage_pips, commission_per_lot=args.commission_per_lot))
+        logger.info("Session momentum qualified=%s; %s", result["qualified_for_later_period"], result["reason"])
+        return
     if args.core:
         if args.llm or args.research:
             parser.error("--core is a separate mechanical-only experiment")

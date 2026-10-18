@@ -18,6 +18,13 @@ RECLAIM_FACTOR_POINTS = {
     "efficient_htf_trend": 1,
     "strong_confirmation_body": 1,
 }
+MOMENTUM_FACTOR_POINTS = {
+    "inside_killzone": 2,
+    "past_only_noise_profile": 2,
+    "outside_noise_band": 2,
+    "twap_aligned": 2,
+    "protected_session_trade": 2,
+}
 
 
 def score_setup(factors: dict, no_high_impact_news_next_15min: bool | None = None) -> dict:
@@ -33,9 +40,11 @@ def score_setup(factors: dict, no_high_impact_news_next_15min: bool | None = Non
     else:
         strategy = factors.get("strategy", "ict")
         weights = RECLAIM_FACTOR_POINTS if strategy == "trend_reclaim" else FACTOR_POINTS
+        if strategy == "session_momentum":
+            weights = MOMENTUM_FACTOR_POINTS
         breakdown = {name: points if factors.get(name, False) else 0
                      for name, points in weights.items()}
-        if strategy not in {"ict", "trend_reclaim"}:
+        if strategy not in {"ict", "trend_reclaim", "session_momentum"}:
             reason = "unknown_strategy"
         if no_high_impact_news_next_15min is None:
             no_high_impact_news_next_15min = factors.get("no_high_impact_news_next_15min", False)
