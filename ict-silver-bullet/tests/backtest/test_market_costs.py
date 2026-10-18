@@ -3,6 +3,7 @@ import json
 import pytest
 
 from backtest.replay import ResearchConfig, load_spread_profile
+from backtest.walk_forward import _stress_config
 from brain.pairs import pair_spec
 
 
@@ -34,3 +35,11 @@ def test_invalid_pair_spread_profiles_are_rejected():
     for profile in ({}, {"EURUSD": -0.1}, {"EURUSD": float("inf")}):
         with pytest.raises(ValueError, match="spread profile"):
             ResearchConfig(spread_pips=profile)
+
+
+def test_stress_doubles_each_pair_cost_without_changing_profile_keys():
+    config = ResearchConfig(spread_pips={"EURUSD": 0.2, "USDJPY": 0.3})
+    stress = _stress_config(config)
+    assert stress.spread_pips == {"EURUSD": 0.4, "USDJPY": 0.6}
+    assert stress.slippage_pips == 2 * config.slippage_pips
+    assert stress.commission_per_lot == 2 * config.commission_per_lot
