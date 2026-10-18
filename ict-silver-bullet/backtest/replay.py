@@ -7,7 +7,7 @@ Historical news is unavailable: the news gate is explicitly skipped.
 
 import argparse
 from collections import Counter, defaultdict, deque
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import math
@@ -17,7 +17,125 @@ from brain import app
 from brain.logging_setup import setup_logging
 from brain.pairs import pair_spec
 from brain.risk import engine
+from brain.risk.position_sizing import DEFAULT_RISK_PCT
 from brain.risk.circuit_breakers import DrawdownState, check_breakers, trading_day_start
+from brain.scheduler.killzone_clock import current_killzone, killzone_close
+
+
+@dataclass(frozen=True)
+class ResearchConfig:
+    """Offline screening assumptions, never production settings or quotations."""
+
+    reward_r: float = 2.0
+    risk_pct: float = DEFAULT_RISK_PCT
+    spread_pips: float = 0.5
+    slippage_pips: float = 0.1
+    commission_per_lot: float = 7.0  # round trip, USD-account assumption
+    max_cost_r: float = 0.2
+    max_hold_minutes: int = 20
+    max_entry_deviation_pips: float = 2.0
+    monthly_target: float = 0.10
+
+    def __post_init__(self):
+        values = asdict(self)
+        if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values.values()):
+            raise ValueError("research assumptions must be finite numbers")
+        if not (0 < self.risk_pct <= .005 and 0 < self.reward_r <= 5 and
+                0 < self.max_cost_r <= 1 and self.monthly_target > 0 and
+                isinstance(self.max_hold_minutes, int) and self.max_hold_minutes > 0):
+            raise ValueError("invalid research risk, reward, cost cap or holding time")
+        if min(self.spread_pips, self.slippage_pips, self.commission_per_lot,
+               self.max_entry_deviation_pips) < 0:
+            raise ValueError("execution costs and deviation must be nonnegative")
+
+
+class BreakoutPullback:
+    """Causal M5 first-pullback hypothesis. Research-only; not a live detector.
+
+    H1 EMA20 trend, prior twelve M5 highs/lows, one reclaim within fifteen
+    minutes. Indicators consume completed bars only, including outside windows.
+    """
+
+    def __init__(self):
+        self.h1 = deque(maxlen=300)
+        self.ema = deque(maxlen=4)
+        self.h1_count = 0
+        self.m5 = deque(maxlen=40)
+        self.bucket = []
+        self.armed = None
+
+    def update_h1(self, row):
+        close = row["close"]
+        self.ema.append(close if not self.ema else self.ema[-1] + 2 / 21 * (close - self.ema[-1]))
+        self.h1.append(row)
+        self.h1_count += 1
+
+    def opposing_level(self, entry, buy):
+        field = "high" if buy else "low"
+        bars = list(self.h1)
+        pools = []
+        for i in range(2, len(bars) - 2):
+            level = bars[i][field]
+            neighbours = [bars[j][field] for j in (i - 2, i - 1, i + 1, i + 2)]
+            pivot = all(level > x if buy else level < x for x in neighbours)
+            untapped = all(b[field] < level if buy else b[field] > level for b in bars[i + 3:])
+            if pivot and untapped and (level > entry if buy else level < entry):
+                pools.append(level)
+        return (min(pools) if buy else max(pools)) if pools else None
+
+    def update_m1(self, row):
+        now = row["ts"] + timedelta(minutes=1)
+        setup = None
+        armed = self.armed
+        if armed and self.h1:
+            buy = armed["buy"]
+            aligned = (self.h1[-1]["close"] > self.ema[-1] > self.ema[0] if buy
+                       else self.h1[-1]["close"] < self.ema[-1] < self.ema[0])
+            fresh = self.h1[-1]["ts"] + timedelta(hours=2) >= now
+            if not aligned or not fresh:
+                self.armed = armed = None
+        if armed and now > armed["expires"]:
+            self.armed = armed = None
+        if armed and row["ts"] >= armed["formed_at"]:
+            buy, level = armed["buy"], armed["level"]
+            armed["extreme"] = (min(armed["extreme"], row["low"]) if buy
+                                else max(armed["extreme"], row["high"]))
+            touched = row["low"] <= level <= row["high"]
+            armed["touched"] = armed["touched"] or touched
+            reclaim = (row["close"] > level and row["close"] > row["open"] if buy
+                       else row["close"] < level and row["close"] < row["open"])
+            if armed["touched"] and reclaim:
+                pip = pair_spec(row["pair"], row["close"])["pip_size"]
+                buffer = max(pip, .1 * armed["atr"])
+                setup = dict(pair=row["pair"], direction="buy" if buy else "sell",
+                             entry=row["close"], stop_loss=armed["extreme"] + (-buffer if buy else buffer),
+                             setup_id=armed["formed_at"].isoformat(),
+                             opposing_level=self.opposing_level(row["close"], buy),
+                             evidence=dict(level=level, atr_m5=armed["atr"],
+                                           h1_ema20=self.ema[-1], h1_ema20_three_bars_ago=self.ema[0]))
+                self.armed = None
+        minute = row["ts"].replace(minute=row["ts"].minute // 5 * 5, second=0, microsecond=0)
+        if self.bucket and self.bucket[0]["ts"].replace(minute=self.bucket[0]["ts"].minute // 5 * 5) != minute:
+            self.bucket.clear()
+        self.bucket.append(row)
+        if len(self.bucket) == 5 and self.bucket[0]["ts"] == minute and now == minute + timedelta(minutes=5):
+            bar = dict(ts=minute, open=self.bucket[0]["open"], close=row["close"],
+                       high=max(b["high"] for b in self.bucket), low=min(b["low"] for b in self.bucket))
+            previous = list(self.m5)
+            self.m5.append(bar)
+            self.bucket.clear()
+            if len(previous) >= 14 and self.h1_count >= 23:
+                ranges = [max(b["high"] - b["low"], abs(b["high"] - p["close"]),
+                              abs(b["low"] - p["close"])) for p, b in zip(previous[-14:], (previous + [bar])[-14:])]
+                atr = sum(ranges) / len(ranges)
+                top, bottom = max(b["high"] for b in previous[-12:]), min(b["low"] for b in previous[-12:])
+                buy = bar["close"] > top and self.h1[-1]["close"] > self.ema[-1] > self.ema[0]
+                sell = bar["close"] < bottom and self.h1[-1]["close"] < self.ema[-1] < self.ema[0]
+                if (buy or sell) and atr > 0:
+                    self.armed = dict(buy=buy, level=top if buy else bottom, atr=atr,
+                                      formed_at=now, expires=now + timedelta(minutes=15), touched=False,
+                                      extreme=top if buy else bottom)
+        return setup
 
 
 def timestamp(value):
@@ -94,6 +212,255 @@ def write_report(path, report):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, default=_json, indent=2), encoding="utf-8")
+
+
+def monthly_statistics(equity_by_month, initial_equity, target=.10):
+    """Include zero-trade months; conservatively exclude boundary months.
+
+    Values are end-of-month marked equity. Boundary months are reported but
+    not counted as complete months because historical coverage can be partial.
+    """
+    items = sorted(equity_by_month.items())
+    rows = []
+    previous = initial_equity
+    for i, (month, equity) in enumerate(items):
+        value = equity / previous - 1
+        rows.append(dict(month=month, return_pct=100 * value, target_met=value >= target,
+                         complete=0 < i < len(items) - 1))
+        previous = equity
+    complete = [r for r in rows if r["complete"]]
+    return dict(months=rows, complete_months=len(complete), target_pct=100 * target,
+                months_at_target=sum(r["target_met"] for r in complete),
+                target_hit_rate=sum(r["target_met"] for r in complete) / len(complete) if complete else None,
+                minimum_month_pct=min((r["return_pct"] for r in complete), default=None),
+                mean_month_pct=sum(r["return_pct"] for r in complete) / len(complete) if complete else None,
+                losing_months=sum(r["return_pct"] < 0 for r in complete),
+                all_complete_months_at_target=bool(complete) and all(r["target_met"] for r in complete))
+
+
+def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_equity=10000.,
+                    decision_start=None, decision_end=None, results_path=None, candidate_provider=None):
+    """Offline hypothesis screening with explicit friction and market-at-next-open fills.
+
+    This intentionally does NOT claim execution parity with the two-leg live
+    executor. ICT comparisons use the shared detector; the breakout hypothesis
+    is research-only. No broker, database, LLM or live-setting writes occur.
+    Bars are assumed Bid OHLC. Real Bid/Ask ticks remain required for validation.
+    candidate_provider is an injectable causal research detector for offline tests.
+    """
+    config = config or ResearchConfig()
+    if strategy not in {"breakout_pullback", "ict_2r"}:
+        raise ValueError("unknown research strategy")
+    if not math.isfinite(initial_equity) or initial_equity <= 0:
+        raise ValueError("initial equity must be positive")
+    start = timestamp(decision_start) if decision_start else None
+    end = timestamp(decision_end) if decision_end else None
+    if start and end and end <= start:
+        raise ValueError("decision_end must follow decision_start")
+    history = normalize_history(rows)
+    events = sorted(history, key=lambda r: (r["ts"] + timedelta(minutes=1 if r["timeframe"] == "M1" else 60),
+                                           r["timeframe"], r["pair"]))
+    models = defaultdict(BreakoutPullback)
+    m1 = defaultdict(lambda: deque(maxlen=app.CANDLE_LIMIT))
+    balance = initial_equity
+    state = DrawdownState(balance, balance)
+    position = pending = None
+    trades, monthly = [], {}
+    counts = losses = 0
+    halted = False
+    daily_halt = None
+    max_dd = 0.
+    prices, seen = {}, set()
+    reasons = Counter()
+    output = None
+    if results_path:
+        path = Path(results_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        output = path.open("w", encoding="utf-8")
+
+    def emit(record):
+        if output:
+            output.write(json.dumps(record, default=_json) + "\n")
+
+    def marked(price=None):
+        if position is None:
+            return balance
+        quote = prices[position["pair"]] if price is None else price
+        exit_quote = quote if position["direction"] == "buy" else quote + position["spread"]
+        return balance + (exit_quote - position["entry"]) * position["sign"] * position["usd_per_price"]
+
+    def close(price, now, reason):
+        nonlocal balance, position, losses
+        slip = config.slippage_pips * position["pip"]
+        execution = price - position["sign"] * slip
+        gross = (execution - position["entry"]) * position["sign"] * position["usd_per_price"]
+        fee = position["lot_size"] * config.commission_per_lot / 2
+        balance += gross - fee
+        net = gross - fee - position["entry_fee"]
+        trade = dict(position, closed_at=now, exit=execution, exit_reason=reason,
+                     gross_pnl=gross, commission=fee + position["entry_fee"], pnl=net,
+                     r_multiple=net / position["risk_usd"])
+        trades.append(trade)
+        losses = losses + 1 if net < 0 else 0
+        emit(dict(type="trade", **trade))
+        position = None
+
+    try:
+        for row in events:
+            pair = row["pair"]
+            now = row["ts"] + timedelta(minutes=1 if row["timeframe"] == "M1" else 60)
+            if end and now >= end:
+                break
+            model = models[pair]
+            if row["timeframe"] == "H1":
+                model.update_h1(row)
+                continue
+            m1[pair].append(row)
+            candidate = model.update_m1(row) if strategy == "breakout_pullback" else None
+            if start and now < start:
+                continue
+            if state.day_start != trading_day_start(now):
+                counts = losses = 0
+            state.update(marked(), balance, now)
+            prices[pair] = row["close"]
+
+            if pending and pending["pair"] == pair:
+                request, pending = pending, None
+                sign = 1 if request["direction"] == "buy" else -1
+                spec = pair_spec(pair, row["open"])
+                pip = spec["pip_size"]
+                spread = config.spread_pips * pip
+                entry = row["open"] + (spread if sign == 1 else 0) + sign * config.slippage_pips * pip
+                stop = request["stop_loss"]
+                distance = sign * (entry - stop)
+                cost_pips = config.spread_pips + 2 * config.slippage_pips + config.commission_per_lot / spec["pip_value_per_lot"]
+                cost_r = cost_pips * pip / distance if distance > 0 else math.inf
+                reason = None
+                if row["ts"] != request["detected_at"]:
+                    reason = "missing_next_bar"
+                elif position is not None or halted or daily_halt == trading_day_start(now):
+                    reason = "account_unavailable"
+                elif distance <= 0:
+                    reason = "invalid_stop_after_fill"
+                elif abs(entry - request["entry"]) / pip > config.max_entry_deviation_pips:
+                    reason = "entry_moved"
+                elif cost_r > config.max_cost_r:
+                    reason = "cost_exceeds_budget"
+                target = entry + sign * config.reward_r * distance
+                obstacle = request.get("opposing_level")
+                if not reason and obstacle is not None and sign * (obstacle - target) < 0:
+                    reason = "insufficient_target_room"
+                # NOTE: Eligibility=10 here means every research rule passed;
+                # it is neither an ICT confluence score nor a win probability.
+                # Shared risk limits remain intact; this model is not live-ready.
+                if not reason:
+                    risk = engine.evaluate_signal(dict(score=10, reason=None), state,
+                        dict(equity=marked(), pair=pair, direction=request["direction"],
+                             stop_loss_pips=distance / pip + config.slippage_pips +
+                                 config.commission_per_lot / spec["pip_value_per_lot"],
+                             pip_value_per_lot=spec["pip_value_per_lot"], risk_pct=config.risk_pct),
+                        [], counts, losses, row["ts"])
+                    if not risk["approved"]:
+                        reason = risk["reason"]
+                if reason:
+                    reasons[reason] += 1
+                    emit(dict(type="rejection", now=now, reason=reason, setup=request))
+                else:
+                    lots = risk["lot_size"]
+                    unit = lots * spec["pip_value_per_lot"] / pip
+                    fee = lots * config.commission_per_lot / 2
+                    balance -= fee
+                    position = dict(request, entry=entry, stop_loss=stop, take_profit=target,
+                                    opened_at=row["ts"], deadline=row["ts"] + timedelta(minutes=config.max_hold_minutes),
+                                    sign=sign, lot_size=lots, risk_usd=distance * unit,
+                                    usd_per_price=unit, pip=pip, spread=spread, entry_fee=fee, estimated_cost_r=cost_r)
+                    counts += 1
+                    reasons["filled"] += 1
+                    emit(dict(type="fill", **position))
+
+            if position and position["pair"] == pair:
+                buy = position["sign"] == 1
+                stop, target = position["stop_loss"], position["take_profit"]
+                low = row["low"] + (0 if buy else position["spread"])
+                high = row["high"] + (0 if buy else position["spread"])
+                if (low <= stop if buy else high >= stop):
+                    opening = row["open"] + (0 if buy else position["spread"])
+                    close(min(stop, opening) if buy else max(stop, opening), now, "stop")
+                else:
+                    # NOTE: OHLC cannot establish tick order. Test adverse
+                    # floating equity before target; classify as bar screening.
+                    adverse = row["low"] if buy else row["high"]
+                    state.update(marked(adverse), balance, now)
+                    max_dd = max(max_dd, state.overall_dd_pct)
+                    breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
+                    if "hard_daily" in breakers or "hard_overall" in breakers:
+                        halted = halted or "hard_overall" in breakers
+                        daily_halt = trading_day_start(now)
+                        close(low if buy else high, now, "circuit_breaker_bar_bound")
+                    elif (high >= target if buy else low <= target):
+                        close(target, now, "target")
+                    elif now >= position["deadline"]:
+                        close(row["close"] + (0 if buy else position["spread"]), now, "time_exit")
+            state.update(marked(), balance, now)
+            max_dd = max(max_dd, state.overall_dd_pct)
+            breakers = check_breakers(state.daily_dd_pct, state.overall_dd_pct)
+            if "hard_daily" in breakers or "hard_overall" in breakers:
+                halted = halted or "hard_overall" in breakers
+                daily_halt = trading_day_start(now)
+                pending = None
+            monthly[now.strftime("%Y-%m")] = marked()
+            zone = current_killzone(now)
+            if zone is None:
+                continue
+            if strategy == "ict_2r" or candidate_provider:
+                context = dict(pair=pair, now=now, htf_candles=list(model.h1))
+                detector = candidate_provider or app._detect_candidate
+                bars = app._bars(list(m1[pair]), now, timedelta(minutes=1)) if strategy == "ict_2r" else list(m1[pair])
+                candidate = detector(bars, context)
+                if candidate and strategy == "ict_2r" and "factors" in candidate:
+                    score = app.confluence.score_setup(candidate["factors"], no_high_impact_news_next_15min=True)
+                    if score["reason"] or score["score"] < app.MIN_SETUP_SCORE:
+                        candidate = None
+                    else:
+                        index = candidate.get("mss", {}).get("index")
+                        if isinstance(index, int) and 0 <= index < len(m1[pair]):
+                            candidate = dict(candidate, setup_id=list(m1[pair])[index]["ts"].isoformat())
+            if candidate is None:
+                continue
+            reasons["candidates"] += 1
+            candidate = dict(candidate, detected_at=now)
+            key = (pair, candidate.get("setup_id", now), candidate["direction"])
+            reason = None
+            if key in seen:
+                reason = "duplicate_setup"
+            elif position or pending:
+                reason = "position_or_reservation_exists"
+            elif halted or daily_halt == trading_day_start(now):
+                reason = "account_halted"
+            elif now + timedelta(minutes=config.max_hold_minutes) >= killzone_close(zone, now):
+                reason = "too_late_in_window"
+            if reason:
+                reasons[reason] += 1
+            else:
+                pending = candidate
+                seen.add(key)
+            emit(dict(type="candidate", now=now, setup=candidate, reason=reason or "pending_next_open"))
+        report = dict(strategy=strategy, research_only=True, live_eligible=False,
+                      evidence_level="M1 Bid-OHLC screening; real-tick and forward validation required",
+                      execution_model="one position; next-open market; fixed R; time exit; stop-first ambiguity",
+                      news_policy="skipped: historical news unavailable", cost_source="explicit assumptions, not verified broker costs",
+                      risk_score_policy="binary research eligibility; not calibrated ICT confluence",
+                      session_policy="unchanged shared live killzones and risk guards",
+                      pattern_policy="H1 EMA20/3-bar slope; M5 prior-12 breakout; first reclaim in 15min; ATR14/one-pip stop buffer",
+                      config=asdict(config), initial_equity=initial_equity, balance=balance, equity=marked(),
+                      metrics=metrics(trades), trades=trades, reasons=dict(reasons), max_drawdown_pct=100 * max_dd,
+                      halted=halted, open_position=position, pending=pending,
+                      monthly=monthly_statistics(monthly, initial_equity, config.monthly_target))
+        emit(dict(type="report", **{k: v for k, v in report.items() if k != "trades"}))
+        return report
+    finally:
+        if output:
+            output.close()
 
 
 def replay(rows, *, threshold=8, initial_equity=10000.0, llm=False,
@@ -285,9 +652,26 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument("--llm", action="store_true")
+    parser.add_argument("--research", choices=("ict_2r", "breakout_pullback"))
+    parser.add_argument("--reward-r", type=float, default=2.)
+    parser.add_argument("--risk-pct", type=float, default=DEFAULT_RISK_PCT)
+    parser.add_argument("--spread-pips", type=float, default=.5)
+    parser.add_argument("--slippage-pips", type=float, default=.1)
+    parser.add_argument("--commission-per-lot", type=float, default=7.)
     args = parser.parse_args()
     logger = setup_logging("backtest")
     rows = load_history(args.data_dir)
+    if args.research:
+        if args.llm:
+            parser.error("research screening does not run the LLM")
+        config = ResearchConfig(reward_r=args.reward_r, risk_pct=args.risk_pct,
+                                spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
+                                commission_per_lot=args.commission_per_lot)
+        report = research_replay(rows, strategy=args.research, config=config,
+                                 results_path=args.output_dir / "research.jsonl")
+        write_report(args.output_dir / "research.json", report)
+        logger.info("Research screening only: metrics=%s monthly=%s", report["metrics"], report["monthly"])
+        return
     for llm in ([False, True] if args.llm else [False]):
         name = "mechanical_llm" if llm else "mechanical"
         report = replay(rows, threshold=args.threshold, llm=llm, collect_decisions=False,

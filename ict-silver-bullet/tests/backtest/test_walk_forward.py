@@ -24,7 +24,7 @@ def test_sweep_never_sees_validate_and_runs_chosen_once(monkeypatch):
     def replay(rows, **kwargs):
         calls.append((rows, kwargs))
         threshold = kwargs["threshold"]
-        return dict(effective_threshold=max(8, threshold), metrics=dict(trades=2, expectancy_r=1 if threshold == 9 else 0),
+        return dict(effective_threshold=max(8, threshold), metrics=dict(trades=50, expectancy_r=1 if threshold == 9 else 0),
                     decisions=[], trades=[])
 
     monkeypatch.setattr(module, "replay", replay)
