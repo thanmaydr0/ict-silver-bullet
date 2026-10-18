@@ -92,7 +92,8 @@ def screen_research(rows, split, *, output_dir=None, config=None, min_tune_trade
     output = Path(output_dir) if output_dir else None
     experiments = (("ict_2r", "ict_2r", replace(config, reward_r=2.)),
                    ("breakout_1_5r", "breakout_pullback", replace(config, reward_r=1.5)),
-                   ("breakout_2r", "breakout_pullback", replace(config, reward_r=2.)))
+                   ("breakout_2r", "breakout_pullback", replace(config, reward_r=2.)),
+                   ("failed_breakout_2r", "failed_breakout", replace(config, reward_r=2.)))
     specification = dict(split=timestamp(split), experiments=[dict(name=n, strategy=s, config=asdict(c)) for n, s, c in experiments],
                          min_tune_trades=min_tune_trades, min_complete_months=min_complete_months,
                          data_status="previously examined history: development only", feasibility=target_feasibility(config.risk_pct))

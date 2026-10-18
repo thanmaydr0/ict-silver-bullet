@@ -138,6 +138,85 @@ class BreakoutPullback:
         return setup
 
 
+class FailedBreakout:
+    """Research-only fade after a completed M5 breakout fails on M1.
+
+    A close outside the prior twelve completed M5 bars arms one event. Within
+    fifteen minutes, the first directional M1 close back across the level is
+    the entry; the stop sits beyond the full observed breakout excursion.
+    Every input is completed before the decision timestamp.
+    """
+
+    def __init__(self):
+        self.m5 = deque(maxlen=40)
+        self.bucket = []
+        self.armed = None
+        self.previous_close = None
+
+    def update_h1(self, row):
+        # research_replay streams explicit H1 rows to every model type.
+        return None
+
+    def update_m1(self, row):
+        now = row["ts"] + timedelta(minutes=1)
+        setup = None
+        armed = self.armed
+        if armed and now > armed["expires"]:
+            self.armed = armed = None
+        if armed and now > armed["formed_at"]:
+            upward = armed["breakout_direction"] == "up"
+            armed["extreme"] = (max(armed["extreme"], row["high"]) if upward
+                                else min(armed["extreme"], row["low"]))
+            crossed_back = (self.previous_close is not None and
+                            ((self.previous_close >= armed["level"] and row["close"] < armed["level"]
+                              and row["close"] < row["open"]) if upward else
+                             (self.previous_close <= armed["level"] and row["close"] > armed["level"]
+                              and row["close"] > row["open"])))
+            if crossed_back:
+                pip = pair_spec(row["pair"], row["close"])["pip_size"]
+                buffer = max(pip, .1 * armed["atr"])
+                direction = "sell" if upward else "buy"
+                stop = armed["extreme"] + buffer if upward else armed["extreme"] - buffer
+                if (stop > row["close"] if upward else stop < row["close"]):
+                    setup = dict(pair=row["pair"], direction=direction, entry=row["close"],
+                                 stop_loss=stop, setup_id=armed["formed_at"].isoformat(),
+                                 opposing_level=None,
+                                 evidence=dict(level=armed["level"], atr_m5=armed["atr"],
+                                               breakout_direction=armed["breakout_direction"],
+                                               breakout_extreme=armed["extreme"]))
+                    self.armed = None
+
+        minute = row["ts"].replace(minute=row["ts"].minute // 5 * 5, second=0, microsecond=0)
+        if self.bucket and self.bucket[0]["ts"].replace(
+                minute=self.bucket[0]["ts"].minute // 5 * 5, second=0, microsecond=0) != minute:
+            self.bucket.clear()
+        self.bucket.append(row)
+        if (len(self.bucket) == 5 and self.bucket[0]["ts"] == minute and
+                [b["ts"] for b in self.bucket] == [minute + timedelta(minutes=i) for i in range(5)] and
+                now == minute + timedelta(minutes=5)):
+            bar = dict(ts=minute, open=self.bucket[0]["open"], close=row["close"],
+                       high=max(b["high"] for b in self.bucket), low=min(b["low"] for b in self.bucket))
+            previous = list(self.m5)
+            self.m5.append(bar)
+            self.bucket.clear()
+            if len(previous) >= 14:
+                ranges = [max(current["high"] - current["low"],
+                              abs(current["high"] - prior["close"]),
+                              abs(current["low"] - prior["close"]))
+                          for prior, current in zip(previous[-14:], (previous + [bar])[-14:])]
+                atr = sum(ranges) / len(ranges)
+                top = max(b["high"] for b in previous[-12:])
+                bottom = min(b["low"] for b in previous[-12:])
+                if atr > 0 and (bar["close"] > top or bar["close"] < bottom):
+                    upward = bar["close"] > top
+                    self.armed = dict(breakout_direction="up" if upward else "down",
+                                      level=top if upward else bottom, atr=atr,
+                                      formed_at=now, expires=now + timedelta(minutes=15),
+                                      extreme=bar["high"] if upward else bar["low"])
+        self.previous_close = row["close"]
+        return setup
+
+
 def timestamp(value):
     value = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
     # Parquet readers return pandas Timestamp subclasses. Convert once at the
@@ -243,13 +322,13 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
     """Offline hypothesis screening with explicit friction and market-at-next-open fills.
 
     This intentionally does NOT claim execution parity with the two-leg live
-    executor. ICT comparisons use the shared detector; the breakout hypothesis
-    is research-only. No broker, database, LLM or live-setting writes occur.
+    executor. ICT comparisons use the shared detector; experimental breakout
+    hypotheses are research-only. No broker, database, LLM or live-setting writes occur.
     Bars are assumed Bid OHLC. Real Bid/Ask ticks remain required for validation.
     candidate_provider is an injectable causal research detector for offline tests.
     """
     config = config or ResearchConfig()
-    if strategy not in {"breakout_pullback", "ict_2r"}:
+    if strategy not in {"breakout_pullback", "failed_breakout", "ict_2r"}:
         raise ValueError("unknown research strategy")
     if not math.isfinite(initial_equity) or initial_equity <= 0:
         raise ValueError("initial equity must be positive")
@@ -260,7 +339,8 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
     history = normalize_history(rows)
     events = sorted(history, key=lambda r: (r["ts"] + timedelta(minutes=1 if r["timeframe"] == "M1" else 60),
                                            r["timeframe"], r["pair"]))
-    models = defaultdict(BreakoutPullback)
+    model_factory = FailedBreakout if strategy == "failed_breakout" else BreakoutPullback
+    models = defaultdict(model_factory)
     m1 = defaultdict(lambda: deque(maxlen=app.CANDLE_LIMIT))
     balance = initial_equity
     state = DrawdownState(balance, balance)
@@ -316,7 +396,7 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 model.update_h1(row)
                 continue
             m1[pair].append(row)
-            candidate = model.update_m1(row) if strategy == "breakout_pullback" else None
+            candidate = model.update_m1(row) if strategy in {"breakout_pullback", "failed_breakout"} else None
             if start and now < start:
                 continue
             if state.day_start != trading_day_start(now):
@@ -451,7 +531,9 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                       news_policy="skipped: historical news unavailable", cost_source="explicit assumptions, not verified broker costs",
                       risk_score_policy="binary research eligibility; not calibrated ICT confluence",
                       session_policy="unchanged shared live killzones and risk guards",
-                      pattern_policy="H1 EMA20/3-bar slope; M5 prior-12 breakout; first reclaim in 15min; ATR14/one-pip stop buffer",
+                      pattern_policy=("M5 close beyond prior 12-bar range; first directional M1 close back across within 15min; stop beyond observed breakout extreme"
+                                      if strategy == "failed_breakout" else
+                                      "H1 EMA20/3-bar slope; M5 prior-12 breakout; first reclaim in 15min; ATR14/one-pip stop buffer"),
                       config=asdict(config), initial_equity=initial_equity, balance=balance, equity=marked(),
                       metrics=metrics(trades), trades=trades, reasons=dict(reasons), max_drawdown_pct=100 * max_dd,
                       halted=halted, open_position=position, pending=pending,
@@ -652,7 +734,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument("--llm", action="store_true")
-    parser.add_argument("--research", choices=("ict_2r", "breakout_pullback"))
+    parser.add_argument("--research", choices=("ict_2r", "breakout_pullback", "failed_breakout"))
     parser.add_argument("--reward-r", type=float, default=2.)
     parser.add_argument("--risk-pct", type=float, default=DEFAULT_RISK_PCT)
     parser.add_argument("--spread-pips", type=float, default=.5)

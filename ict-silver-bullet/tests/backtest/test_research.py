@@ -3,7 +3,8 @@ from datetime import timedelta
 
 import pytest
 
-from backtest.replay import (BreakoutPullback, ResearchConfig, monthly_statistics, research_replay)
+from backtest.replay import (BreakoutPullback, FailedBreakout, ResearchConfig,
+                             monthly_statistics, research_replay)
 from backtest import walk_forward as wf
 from tests.backtest.test_replay import BASE, candles
 
@@ -112,6 +113,36 @@ def test_breakout_needs_completed_m5_then_later_reclaim():
     assert setup["evidence"]["level"] == pytest.approx(1.1006)
 
 
+def test_failed_breakout_waits_for_completed_break_then_m1_cross_back():
+    model = FailedBreakout()
+    series = [dict(pair="EURUSD", ts=BASE + timedelta(minutes=i), open=1.1001,
+                   high=1.1006, low=1.0998, close=1.1001) for i in range(75)]
+    for row in series[70:75]:
+        row.update(open=1.1007, high=1.1015, low=1.1006, close=1.1012)
+
+    # The breakout becomes known only at the close of its fifth M1 candle.
+    for row in series:
+        assert model.update_m1(row) is None
+    assert model.armed["formed_at"] == BASE + timedelta(minutes=75)
+
+    failure = dict(pair="EURUSD", ts=BASE + timedelta(minutes=75), open=1.1012,
+                   high=1.1014, low=1.1000, close=1.1004)
+    setup = model.update_m1(failure)
+    assert setup["direction"] == "sell"
+    assert setup["entry"] == pytest.approx(1.1004)
+    assert setup["stop_loss"] == pytest.approx(1.1016)
+    assert setup["setup_id"] == (BASE + timedelta(minutes=75)).isoformat()
+    assert setup["evidence"]["breakout_direction"] == "up"
+
+
+def test_failed_breakout_research_is_research_only_and_labeled():
+    rows = candles(3)
+    report = research_replay(rows, strategy="failed_breakout")
+    assert report["strategy"] == "failed_breakout"
+    assert "first directional M1 close back" in report["pattern_policy"]
+    assert report["research_only"] and not report["live_eligible"]
+
+
 def test_research_sweep_keeps_later_data_out_and_runs_one_choice(monkeypatch):
     calls = []
     split = BASE + timedelta(minutes=3)
@@ -126,8 +157,8 @@ def test_research_sweep_keeps_later_data_out_and_runs_one_choice(monkeypatch):
     result = wf.screen_research(candles(6), split)
     assert result["chosen"] == "breakout_2r"
     assert not result["promotion_passed"] and not result["live_eligible"]
-    assert len(calls) == 4
-    assert all(r["ts"] + timedelta(minutes=1) < split for rows, _ in calls[:3] for r in rows)
+    assert len(calls) == 5
+    assert all(r["ts"] + timedelta(minutes=1) < split for rows, _ in calls[:4] for r in rows)
     assert calls[-1][1]["decision_start"] == split
 
 
