@@ -7,6 +7,7 @@ reference: dukascopy-node and its historical-data clients. No bars are filled.
 
 import argparse
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import lzma
@@ -86,7 +87,11 @@ def fetch(url, *, attempts=3, opener=urlopen, sleeper=time.sleep):
             if error.code not in {429, 500, 502, 503, 504} or attempt == attempts-1:
                 raise
             retry = error.headers.get("Retry-After", "60")
-            delay = int(retry) if retry.isdigit() else 60
+            try:
+                delay = int(retry) if retry.isdigit() else max(0, (
+                    parsedate_to_datetime(retry)-datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                delay = 60
             remaining = max(delay, 60 if error.code == 429 else 2**attempt)
             while remaining > 0:
                 step = min(remaining, 60)
