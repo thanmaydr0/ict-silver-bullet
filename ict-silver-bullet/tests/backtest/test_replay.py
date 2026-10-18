@@ -129,6 +129,7 @@ def test_parquet_loader_reads_phase_one_shape(tmp_path):
     pd.DataFrame(candles()).to_parquet(tmp_path / "EURUSD_M1.parquet", index=False)
     loaded = module.load_history(tmp_path)
     assert list(loaded) == candles()
+    assert all(type(row["ts"]) is datetime for row in loaded)
 
 
 def test_normalized_history_reused_without_mutation():

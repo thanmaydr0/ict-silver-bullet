@@ -22,6 +22,10 @@ from brain.risk.circuit_breakers import DrawdownState, check_breakers, trading_d
 
 def timestamp(value):
     value = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
+    # Parquet readers return pandas Timestamp subclasses. Convert once at the
+    # boundary so the shared live evaluator uses ordinary datetime arithmetic.
+    if hasattr(value, "to_pydatetime"):
+        value = value.to_pydatetime()
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamps must be timezone-aware")
     return value.astimezone(timezone.utc)
