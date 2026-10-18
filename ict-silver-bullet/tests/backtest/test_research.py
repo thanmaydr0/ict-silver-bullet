@@ -3,7 +3,7 @@ from datetime import timedelta
 
 import pytest
 
-from backtest.replay import (BreakoutPullback, FailedBreakout, ResearchConfig,
+from backtest.replay import (BreakoutPullback, FailedBreakout, StopCascadeContinuation, ResearchConfig,
                              monthly_statistics, research_replay)
 from backtest import walk_forward as wf
 from tests.backtest.test_replay import BASE, candles
@@ -143,6 +143,33 @@ def test_failed_breakout_research_is_research_only_and_labeled():
     assert report["research_only"] and not report["live_eligible"]
 
 
+def test_stop_cascade_uses_completed_range_and_suppresses_same_range_reentry():
+    model = StopCascadeContinuation()
+    prior = [dict(pair="EURUSD", ts=BASE + timedelta(minutes=i), open=1.1,
+                  high=1.1001, low=1.0999, close=1.1) for i in range(30)]
+    for row in prior:
+        assert model.update_m1(row) is None
+
+    trigger = dict(pair="EURUSD", ts=BASE + timedelta(minutes=30), open=1.1003,
+                   high=1.1005, low=1.1003, close=1.1004)
+    setup = model.update_m1(trigger)
+    assert setup["direction"] == "buy"
+    assert setup["evidence"]["prior_range_high"] == pytest.approx(1.1001)
+    assert setup["setup_id"] == trigger["ts"].isoformat()
+    assert setup["max_stop_distance"] == pytest.approx(.0002)
+
+    for i in range(31, 60):
+        later_break = dict(trigger, ts=BASE + timedelta(minutes=i))
+        assert model.update_m1(later_break) is None
+
+
+def test_stop_cascade_research_is_labeled_research_only():
+    report = research_replay(candles(3), strategy="stop_cascade_continuation")
+    assert report["strategy"] == "stop_cascade_continuation"
+    assert "prior 30-bar range" in report["pattern_policy"]
+    assert report["research_only"] and not report["live_eligible"]
+
+
 def test_research_sweep_keeps_later_data_out_and_runs_one_choice(monkeypatch):
     calls = []
     split = BASE + timedelta(minutes=3)
@@ -157,8 +184,8 @@ def test_research_sweep_keeps_later_data_out_and_runs_one_choice(monkeypatch):
     result = wf.screen_research(candles(6), split)
     assert result["chosen"] == "breakout_2r"
     assert not result["promotion_passed"] and not result["live_eligible"]
-    assert len(calls) == 5
-    assert all(r["ts"] + timedelta(minutes=1) < split for rows, _ in calls[:4] for r in rows)
+    assert len(calls) == 6
+    assert all(r["ts"] + timedelta(minutes=1) < split for rows, _ in calls[:5] for r in rows)
     assert calls[-1][1]["decision_start"] == split
 
 

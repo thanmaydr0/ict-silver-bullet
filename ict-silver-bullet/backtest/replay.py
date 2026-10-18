@@ -217,6 +217,67 @@ class FailedBreakout:
         return setup
 
 
+class StopCascadeContinuation:
+    """Research-only continuation after a completed close outside a range.
+
+    Uses only the prior 30 completed M1 bars for the range and prior 20 for
+    ATR. The confirming M1 bar must close at least 0.1 ATR beyond the range;
+    a stop wider than 1 ATR is rejected rather than tightened artificially.
+    The replay limits entries to the shared live killzones.
+    """
+
+    def __init__(self, spread_pips=0.5):
+        self.m1 = deque(maxlen=40)
+        self.bars_seen = 0
+        self.next_eligible_bar = 0
+        self.spread_pips = spread_pips
+
+    def update_h1(self, row):
+        return None
+
+    def update_m1(self, row):
+        prior = list(self.m1)
+        self.m1.append(row)
+        self.bars_seen += 1
+        if len(prior) < 30 or self.bars_seen < self.next_eligible_bar:
+            return None
+
+        atr_bars = prior[-20:]
+        true_ranges = []
+        for i, bar in enumerate(atr_bars):
+            previous_close = atr_bars[i - 1]["close"] if i else prior[-21]["close"]
+            true_ranges.append(max(bar["high"] - bar["low"],
+                                   abs(bar["high"] - previous_close),
+                                   abs(bar["low"] - previous_close)))
+        atr = sum(true_ranges) / len(true_ranges)
+        if atr <= 0:
+            return None
+        top = max(bar["high"] for bar in prior[-30:])
+        bottom = min(bar["low"] for bar in prior[-30:])
+        upward = row["high"] >= top + .1 * atr and row["close"] > top
+        downward = row["low"] <= bottom - .1 * atr and row["close"] < bottom
+        if not upward and not downward:
+            return None
+
+        buy = upward
+        pip = pair_spec(row["pair"], row["close"])["pip_size"]
+        buffer = self.spread_pips * pip
+        stop = row["low"] - buffer if buy else row["high"] + buffer
+        distance = abs(row["close"] - stop)
+        if distance <= 0 or distance > atr:
+            return None
+
+        self.next_eligible_bar = self.bars_seen + 30
+        return dict(pair=row["pair"], direction="buy" if buy else "sell",
+                    entry=row["close"], stop_loss=stop,
+                    setup_id=row["ts"].isoformat(), opposing_level=None,
+                    max_stop_distance=atr,
+                    evidence=dict(prior_range_high=top, prior_range_low=bottom,
+                                  atr_m1=atr, breakout_extension_atr=(
+                                      (row["high"] - top) if buy else (bottom - row["low"])) / atr,
+                                  breakout_bar_low=row["low"], breakout_bar_high=row["high"]))
+
+
 def timestamp(value):
     value = datetime.fromisoformat(value.replace("Z", "+00:00")) if isinstance(value, str) else value
     # Parquet readers return pandas Timestamp subclasses. Convert once at the
@@ -328,7 +389,7 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
     candidate_provider is an injectable causal research detector for offline tests.
     """
     config = config or ResearchConfig()
-    if strategy not in {"breakout_pullback", "failed_breakout", "ict_2r"}:
+    if strategy not in {"breakout_pullback", "failed_breakout", "stop_cascade_continuation", "ict_2r"}:
         raise ValueError("unknown research strategy")
     if not math.isfinite(initial_equity) or initial_equity <= 0:
         raise ValueError("initial equity must be positive")
@@ -339,7 +400,10 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
     history = normalize_history(rows)
     events = sorted(history, key=lambda r: (r["ts"] + timedelta(minutes=1 if r["timeframe"] == "M1" else 60),
                                            r["timeframe"], r["pair"]))
-    model_factory = FailedBreakout if strategy == "failed_breakout" else BreakoutPullback
+    model_factory = (FailedBreakout if strategy == "failed_breakout" else
+                     (lambda: StopCascadeContinuation(config.spread_pips))
+                     if strategy == "stop_cascade_continuation" else
+                     BreakoutPullback)
     models = defaultdict(model_factory)
     m1 = defaultdict(lambda: deque(maxlen=app.CANDLE_LIMIT))
     balance = initial_equity
@@ -396,7 +460,8 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 model.update_h1(row)
                 continue
             m1[pair].append(row)
-            candidate = model.update_m1(row) if strategy in {"breakout_pullback", "failed_breakout"} else None
+            candidate = model.update_m1(row) if strategy in {
+                "breakout_pullback", "failed_breakout", "stop_cascade_continuation"} else None
             if start and now < start:
                 continue
             if state.day_start != trading_day_start(now):
@@ -422,6 +487,8 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                     reason = "account_unavailable"
                 elif distance <= 0:
                     reason = "invalid_stop_after_fill"
+                elif distance > request.get("max_stop_distance", math.inf):
+                    reason = "stop_exceeds_atr_cap"
                 elif abs(entry - request["entry"]) / pip > config.max_entry_deviation_pips:
                     reason = "entry_moved"
                 elif cost_r > config.max_cost_r:
@@ -533,6 +600,7 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                       session_policy="unchanged shared live killzones and risk guards",
                       pattern_policy=("M5 close beyond prior 12-bar range; first directional M1 close back across within 15min; stop beyond observed breakout extreme"
                                       if strategy == "failed_breakout" else
+                                      "M1 close at least 0.1 ATR beyond prior 30-bar range in shared live killzones; next-open entry; breakout-bar stop capped at ATR20; 1.25R target candidate" if strategy == "stop_cascade_continuation" else
                                       "H1 EMA20/3-bar slope; M5 prior-12 breakout; first reclaim in 15min; ATR14/one-pip stop buffer"),
                       config=asdict(config), initial_equity=initial_equity, balance=balance, equity=marked(),
                       metrics=metrics(trades), trades=trades, reasons=dict(reasons), max_drawdown_pct=100 * max_dd,

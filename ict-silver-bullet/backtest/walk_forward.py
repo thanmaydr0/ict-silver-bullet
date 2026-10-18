@@ -80,7 +80,7 @@ def target_feasibility(risk_pct=.0025, trades_per_day=4, trading_days=20, target
 
 def screen_research(rows, split, *, output_dir=None, config=None, min_tune_trades=100,
                     min_complete_months=6, candidate_providers=None):
-    """Three declared hypotheses, no tuning on later candles, no live promotion.
+    """Five declared hypotheses, no tuning on later candles, no live promotion.
 
     All previously examined history is development evidence. The later slice
     is a retrospective diagnostic, not a new untouched forward test.
@@ -93,7 +93,9 @@ def screen_research(rows, split, *, output_dir=None, config=None, min_tune_trade
     experiments = (("ict_2r", "ict_2r", replace(config, reward_r=2.)),
                    ("breakout_1_5r", "breakout_pullback", replace(config, reward_r=1.5)),
                    ("breakout_2r", "breakout_pullback", replace(config, reward_r=2.)),
-                   ("failed_breakout_2r", "failed_breakout", replace(config, reward_r=2.)))
+                   ("failed_breakout_2r", "failed_breakout", replace(config, reward_r=2.)),
+                   ("stop_cascade_1_25r", "stop_cascade_continuation",
+                    replace(config, reward_r=1.25, max_hold_minutes=30)))
     specification = dict(split=timestamp(split), experiments=[dict(name=n, strategy=s, config=asdict(c)) for n, s, c in experiments],
                          min_tune_trades=min_tune_trades, min_complete_months=min_complete_months,
                          data_status="previously examined history: development only", feasibility=target_feasibility(config.risk_pct))
