@@ -11,6 +11,7 @@ from email.utils import parsedate_to_datetime
 import hashlib
 import json
 import lzma
+import logging
 import math
 from pathlib import Path
 import struct
@@ -22,6 +23,7 @@ from brain.logging_setup import setup_logging
 
 PAIRS = {"EURUSD": 100000, "GBPUSD": 100000, "USDJPY": 1000}
 RECORD = struct.Struct(">5If")
+logger = logging.getLogger(__name__)
 
 
 def daily_url(pair, day, side):
@@ -74,6 +76,8 @@ def merge_sides(bids, asks):
 
 def fetch(url, *, attempts=3, opener=urlopen, sleeper=time.sleep):
     """Bounded retries; respect rate limits and never substitute empty on error."""
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
     for attempt in range(attempts):
         try:
             request = Request(url, headers={"User-Agent": "forex-ict-reference-research/1.0"})
@@ -92,15 +96,20 @@ def fetch(url, *, attempts=3, opener=urlopen, sleeper=time.sleep):
                     parsedate_to_datetime(retry)-datetime.now(timezone.utc)).total_seconds())
             except (TypeError, ValueError, OverflowError):
                 delay = 60
-            remaining = max(delay, 60 if error.code == 429 else 2**attempt)
+            remaining = max(delay, 60 if error.code == 429 else min(60, 2**attempt))
+            logger.warning("Reference HTTP %s: retry %d/%d in %.1fs: %s",
+                           error.code, attempt+2, attempts, remaining, url)
             while remaining > 0:
                 step = min(remaining, 60)
                 sleeper(step)
                 remaining -= step
-        except (URLError, TimeoutError):
+        except (URLError, TimeoutError) as error:
             if attempt == attempts-1:
                 raise
-            sleeper(2**attempt)
+            delay = min(60, 2**attempt)
+            logger.warning("Reference %s: retry %d/%d in %ds: %s",
+                           type(error).__name__, attempt+2, attempts, delay, url)
+            sleeper(delay)
     raise RuntimeError("reference download exhausted")
 
 

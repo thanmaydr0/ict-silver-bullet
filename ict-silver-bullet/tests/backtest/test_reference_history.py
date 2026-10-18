@@ -59,6 +59,19 @@ def test_rate_limit_is_respected_and_not_treated_as_missing_history():
     assert reference.fetch("https://example.test", opener=missing) == b""
 
 
+def test_extended_outage_has_capped_backoff_and_visible_retries(caplog):
+    error = HTTPError("https://example.test", 503, "unavailable", {}, None)
+    opener = Mock(side_effect=error)
+    waits = []
+    with pytest.raises(HTTPError):
+        reference.fetch("https://example.test", attempts=12, opener=opener, sleeper=waits.append)
+    assert opener.call_count == 12
+    assert waits == [60]*11
+    assert "retry 12/12 in 60.0s" in caplog.text
+    with pytest.raises(ValueError, match="positive"):
+        reference.fetch("https://example.test", attempts=0, opener=opener)
+
+
 def test_export_caches_valid_payloads_and_records_provenance_without_network(tmp_path):
     bid = packed([(0,110000,110002,109999,110005,1.)])
     ask = packed([(0,110010,110012,110009,110015,1.)])
