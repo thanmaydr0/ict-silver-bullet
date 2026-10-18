@@ -69,6 +69,18 @@ def test_cost_gate_and_actual_fill_geometry_gate():
     assert not report["trades"] and report["reasons"]["insufficient_target_room"] == 1
 
 
+def test_pair_specific_spread_is_used_for_entry_cost_and_target():
+    rows = candles(2)
+    rows[1] = dict(rows[1], low=1.1, high=1.103)
+    config = ResearchConfig(spread_pips={"EURUSD": 1.25})
+    report = research_replay(rows, candidate_provider=candidate, config=config)
+    trade = report["trades"][0]
+    assert trade["entry"] == pytest.approx(1.100135)
+    assert trade["estimated_cost_r"] > 0
+    assert trade["take_profit"] == pytest.approx(
+        trade["entry"] + 2 * (trade["entry"] - trade["stop_loss"]))
+
+
 def test_time_exit_and_future_prices_cannot_change_prefix():
     rows = candles(5)
     for row in rows:
@@ -194,11 +206,13 @@ def test_research_sweep_keeps_later_data_out_and_runs_one_choice(monkeypatch):
     def fake(rows, **kwargs):
         calls.append((rows, kwargs))
         good = kwargs["strategy"] == "breakout_pullback" and kwargs["config"].reward_r == 2
+        value = .2 if good else -.1
         return dict(metrics=dict(trades=200, expectancy_r=.2 if good else -.1),
-                    monthly=dict(complete_months=12), max_drawdown_pct=1, halted=False, trades=[])
+                    monthly=dict(complete_months=12), max_drawdown_pct=1, halted=False,
+                    trades=[dict(opened_at=BASE+timedelta(days=i), r_multiple=value) for i in range(60)])
 
     monkeypatch.setattr(wf, "research_replay", fake)
-    result = wf.screen_research(candles(6), split)
+    result = wf.screen_research(candles(6), split, bootstrap_samples=50)
     assert result["chosen"] == "breakout_2r"
     assert not result["promotion_passed"] and not result["live_eligible"]
     assert len(calls) == 6

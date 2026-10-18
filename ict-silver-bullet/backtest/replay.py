@@ -29,7 +29,7 @@ class ResearchConfig:
 
     reward_r: float = 2.0
     risk_pct: float = DEFAULT_RISK_PCT
-    spread_pips: float = 0.5
+    spread_pips: float | dict[str, float] = 0.5
     slippage_pips: float = 0.1
     commission_per_lot: float = 7.0  # round trip, USD-account assumption
     max_cost_r: float = 0.2
@@ -40,16 +40,52 @@ class ResearchConfig:
 
     def __post_init__(self):
         values = asdict(self)
+        values.pop("spread_pips")
         if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in values.values()):
             raise ValueError("research assumptions must be finite numbers")
+        spreads = self.spread_pips.values() if isinstance(self.spread_pips, dict) else (self.spread_pips,)
+        if (isinstance(self.spread_pips, dict) and not self.spread_pips) or not all(
+                isinstance(value, (int, float)) and math.isfinite(value) and value >= 0 for value in spreads):
+            raise ValueError("spread profile must contain finite, nonnegative pip values")
         if not (0 < self.risk_pct <= .005 and 0 < self.reward_r <= 5 and
                 0 < self.max_cost_r <= 1 and self.monthly_target > 0 and
                 self.historical_spread_multiplier >= 1 and
                 isinstance(self.max_hold_minutes, int) and self.max_hold_minutes > 0):
             raise ValueError("invalid research risk, reward, cost cap or holding time")
-        if min(self.spread_pips, self.slippage_pips, self.commission_per_lot,
-               self.max_entry_deviation_pips) < 0:
+        if min(self.slippage_pips, self.commission_per_lot, self.max_entry_deviation_pips) < 0:
             raise ValueError("execution costs and deviation must be nonnegative")
+
+    def spread_for(self, pair):
+        """Return the frozen spread assumption for a pair, failing on gaps."""
+        if isinstance(self.spread_pips, dict):
+            try:
+                return self.spread_pips[pair]
+            except KeyError as exc:
+                raise ValueError(f"spread profile has no entry for {pair}") from exc
+        return self.spread_pips
+
+
+def load_spread_profile(path):
+    """Read either a pair-to-pips map or the compact tick-audit JSON report."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("spreads"), list):
+        data = {row["symbol"]: row["p95_pips"] for row in data["spreads"]
+                if row.get("p95_pips") is not None}
+    if not isinstance(data, dict) or not data:
+        raise ValueError("spread profile must contain pair-to-pips values")
+    profile = {str(pair): float(value) for pair, value in data.items()}
+    if any(not pair or not math.isfinite(value) or value < 0 for pair, value in profile.items()):
+        raise ValueError("spread profile must contain finite, nonnegative pip values")
+    return profile
+
+
+def _spread_for_pair(spread_pips, pair):
+    if isinstance(spread_pips, dict):
+        try:
+            return spread_pips[pair]
+        except KeyError as exc:
+            raise ValueError(f"spread profile has no entry for {pair}") from exc
+    return spread_pips
 
 
 class BreakoutPullback:
@@ -264,7 +300,7 @@ class StopCascadeContinuation:
 
         buy = upward
         pip = pair_spec(row["pair"], row["close"])["pip_size"]
-        buffer = self.spread_pips * pip
+        buffer = _spread_for_pair(self.spread_pips, row["pair"]) * pip
         stop = row["low"] - buffer if buy else row["high"] + buffer
         distance = abs(row["close"] - stop)
         if distance <= 0 or distance > atr:
@@ -510,11 +546,12 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 sign = 1 if request["direction"] == "buy" else -1
                 spec = pair_spec(pair, row["open"])
                 pip = spec["pip_size"]
-                spread = config.spread_pips * pip
+                spread_pips = config.spread_for(pair)
+                spread = spread_pips * pip
                 entry = row["open"] + (spread if sign == 1 else 0) + sign * config.slippage_pips * pip
                 stop = request["stop_loss"]
                 distance = sign * (entry - stop)
-                cost_pips = config.spread_pips + 2 * config.slippage_pips + config.commission_per_lot / spec["pip_value_per_lot"]
+                cost_pips = spread_pips + 2 * config.slippage_pips + config.commission_per_lot / spec["pip_value_per_lot"]
                 cost_r = cost_pips * pip / distance if distance > 0 else math.inf
                 reason = None
                 if row["ts"] != request["detected_at"]:
@@ -655,7 +692,10 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                       execution_model=("one scalp position; next-open Bid/Ask fill; original signal target; time/session exit; stop-first ambiguity; excludes live runner"
                                        if strategy == "core" else
                                        "one position; next-open market; fixed R; time exit; stop-first ambiguity"),
-                      news_policy="skipped: historical news unavailable", cost_source="explicit assumptions, not verified broker costs",
+                      news_policy="skipped: historical news unavailable",
+                      cost_source=("pair-specific spread profile supplied; slippage and commission remain explicit assumptions"
+                                   if isinstance(config.spread_pips, dict) else
+                                   "explicit assumptions, not verified broker costs"),
                       risk_score_policy="shared core confluence and risk engine" if strategy == "core" else
                                         "binary research eligibility; not calibrated ICT confluence",
                       core_threshold=threshold if strategy == "core" else None,
@@ -697,7 +737,7 @@ def ask_quotes(row, config):
             raise ValueError("invalid historical Ask candle")
         extra = (config.historical_spread_multiplier-1)*(result["open"]-row["open"])
         return {field: price+extra for field, price in result.items()}
-    spread = config.spread_pips*pair_spec(row["pair"], row["open"])["pip_size"]
+    spread = config.spread_for(row["pair"])*pair_spec(row["pair"], row["open"])["pip_size"]
     return {field: row[field]+spread for field in fields}
 
 
@@ -1084,6 +1124,8 @@ def main():
     parser.add_argument("--reward-r", type=float, default=2.)
     parser.add_argument("--risk-pct", type=float, default=DEFAULT_RISK_PCT)
     parser.add_argument("--spread-pips", type=float, default=.5)
+    parser.add_argument("--spread-profile", type=Path,
+                        help="JSON pair-to-pips profile, such as a tick-audit report")
     parser.add_argument("--slippage-pips", type=float, default=.1)
     parser.add_argument("--commission-per-lot", type=float, default=7.)
     args = parser.parse_args()
@@ -1093,7 +1135,8 @@ def main():
         if args.llm:
             parser.error("research screening does not run the LLM")
         config = ResearchConfig(reward_r=args.reward_r, risk_pct=args.risk_pct,
-                                spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
+                                spread_pips=load_spread_profile(args.spread_profile) if args.spread_profile else args.spread_pips,
+                                slippage_pips=args.slippage_pips,
                                 commission_per_lot=args.commission_per_lot)
         if args.research == "session_momentum":
             report = session_momentum_replay(rows, config=config,

@@ -66,10 +66,13 @@ def test_core_sweep_never_sees_later_period_and_stress_cannot_select(monkeypatch
     split = BASE+timedelta(minutes=3)
     def fake(rows, **kwargs):
         calls.append((rows, kwargs))
-        return dict(metrics=dict(trades=150, expectancy_r=.3 if kwargs["threshold"] == 9 else .1),
-                    monthly=dict(complete_months=12), max_drawdown_pct=1., halted=False, trades=[])
+        value = .3 if kwargs["threshold"] == 9 else .1
+        return dict(metrics=dict(trades=150, expectancy_r=value),
+                    monthly=dict(complete_months=12), max_drawdown_pct=1., halted=False,
+                    trades=[dict(opened_at=BASE+timedelta(days=i//2), r_multiple=value)
+                            for i in range(120)])
     monkeypatch.setattr(wf, "research_replay", fake)
-    result = wf.core_walk_forward(candles(6), split, output_dir=tmp_path)
+    result = wf.core_walk_forward(candles(6), split, output_dir=tmp_path, bootstrap_samples=50)
     assert result["chosen_threshold"] == 9
     assert len(calls) == 5
     assert all(r["ts"]+timedelta(minutes=1) < split for rows, _ in calls[:3] for r in rows)
