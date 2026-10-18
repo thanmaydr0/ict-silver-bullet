@@ -379,18 +379,24 @@ def monthly_statistics(equity_by_month, initial_equity, target=.10):
 
 
 def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_equity=10000.,
-                    decision_start=None, decision_end=None, results_path=None, candidate_provider=None):
+                    decision_start=None, decision_end=None, results_path=None, candidate_provider=None,
+                    threshold=8):
     """Offline hypothesis screening with explicit friction and market-at-next-open fills.
 
     This intentionally does NOT claim execution parity with the two-leg live
-    executor. ICT comparisons use the shared detector; experimental breakout
-    hypotheses are research-only. No broker, database, LLM or live-setting writes occur.
+    executor. Core mode calls evaluate_candles; ICT comparisons use the legacy
+    detector; experimental breakout hypotheses are research-only. No broker,
+    database, LLM or live-setting writes occur.
     Bars are assumed Bid OHLC. Real Bid/Ask ticks remain required for validation.
     candidate_provider is an injectable causal research detector for offline tests.
     """
     config = config or ResearchConfig()
-    if strategy not in {"breakout_pullback", "failed_breakout", "stop_cascade_continuation", "ict_2r"}:
+    if strategy not in {"breakout_pullback", "failed_breakout", "stop_cascade_continuation", "ict_2r", "core"}:
         raise ValueError("unknown research strategy")
+    if threshold not in (8, 9, 10):
+        raise ValueError("core threshold must be 8, 9 or 10")
+    if strategy == "core" and config.reward_r != 2.:
+        raise ValueError("core uses its fixed 2R signal target")
     if not math.isfinite(initial_equity) or initial_equity <= 0:
         raise ValueError("initial equity must be positive")
     start = timestamp(decision_start) if decision_start else None
@@ -405,6 +411,8 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                      if strategy == "stop_cascade_continuation" else
                      BreakoutPullback)
     models = defaultdict(model_factory)
+    explicit_h1 = {r["pair"] for r in history if r["timeframe"] == "H1"}
+    core_h1_buckets = defaultdict(dict)
     m1 = defaultdict(lambda: deque(maxlen=app.CANDLE_LIMIT))
     balance = initial_equity
     state = DrawdownState(balance, balance)
@@ -425,6 +433,15 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
     def emit(record):
         if output:
             output.write(json.dumps(record, default=_json) + "\n")
+
+    def core_scorer(factors, **kwargs):
+        score = app.confluence.score_setup(factors, **kwargs)
+        if not score["reason"] and score["score"] < threshold:
+            score = dict(score, reason="score_below_sweep_threshold")
+        return score
+
+    def core_risk(score, drawdown, account, *args):
+        return engine.evaluate_signal(score, drawdown, dict(account, risk_pct=config.risk_pct), *args)
 
     def marked(price=None):
         if position is None:
@@ -460,6 +477,18 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 model.update_h1(row)
                 continue
             m1[pair].append(row)
+            if strategy == "core" and pair not in explicit_h1:
+                hour = row["ts"].replace(minute=0, second=0, microsecond=0)
+                bucket = core_h1_buckets[pair]
+                if bucket and next(iter(bucket)).replace(minute=0) != hour:
+                    bucket.clear()
+                bucket[row["ts"]] = row
+                expected = [hour + timedelta(minutes=i) for i in range(60)]
+                if now == hour + timedelta(hours=1) and sorted(bucket) == expected:
+                    part = [bucket[ts] for ts in expected]
+                    model.update_h1(dict(ts=hour, open=part[0]["open"], close=part[-1]["close"],
+                                         high=max(r["high"] for r in part), low=min(r["low"] for r in part)))
+                    bucket.clear()
             if strategy == "stop_cascade_continuation":
                 eligible = current_killzone(now) is not None and not (start and now < start)
                 candidate = model.update_m1(row, eligible=eligible)
@@ -497,7 +526,9 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                     reason = "entry_moved"
                 elif cost_r > config.max_cost_r:
                     reason = "cost_exceeds_budget"
-                target = entry + sign * config.reward_r * distance
+                target = request["take_profit"] if strategy == "core" else entry + sign * config.reward_r * distance
+                if not reason and sign * (target - entry) <= 0:
+                    reason = "target_passed_before_fill"
                 obstacle = request.get("opposing_level")
                 if not reason and obstacle is not None and sign * (obstacle - target) < 0:
                     reason = "insufficient_target_room"
@@ -505,7 +536,7 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 # it is neither an ICT confluence score nor a win probability.
                 # Shared risk limits remain intact; this model is not live-ready.
                 if not reason:
-                    risk = engine.evaluate_signal(dict(score=10, reason=None), state,
+                    risk = engine.evaluate_signal(dict(score=request.get("confluence_score", 10), reason=None), state,
                         dict(equity=marked(), pair=pair, direction=request["direction"],
                              stop_loss_pips=distance / pip + config.slippage_pips +
                                  config.commission_per_lot / spec["pip_value_per_lot"],
@@ -521,8 +552,11 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                     unit = lots * spec["pip_value_per_lot"] / pip
                     fee = lots * config.commission_per_lot / 2
                     balance -= fee
+                    deadline = row["ts"] + timedelta(minutes=config.max_hold_minutes)
+                    if strategy == "core":
+                        deadline = min(deadline, killzone_close(current_killzone(row["ts"]), row["ts"]))
                     position = dict(request, entry=entry, stop_loss=stop, take_profit=target,
-                                    opened_at=row["ts"], deadline=row["ts"] + timedelta(minutes=config.max_hold_minutes),
+                                    opened_at=row["ts"], deadline=deadline,
                                     sign=sign, lot_size=lots, risk_usd=distance * unit,
                                     usd_per_price=unit, pip=pip, spread=spread, entry_fee=fee, estimated_cost_r=cost_r)
                     counts += 1
@@ -563,8 +597,24 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
             zone = current_killzone(now)
             if zone is None:
                 continue
-            if strategy == "ict_2r" or candidate_provider:
-                context = dict(pair=pair, now=now, htf_candles=list(model.h1))
+            if strategy == "core":
+                context = dict(pair=pair, now=now, htf_candles=list(model.h1), news_events=[],
+                    score_setup=core_scorer, evaluate_signal=core_risk,
+                    review_setup=lambda _: dict(verdict="approve", conviction=1.,
+                        reasoning="Mechanical-only experiment; LLM bypassed"),
+                    risk_state=dict(equity=marked(), drawdown_state=state, trades_today=counts,
+                        consecutive_losses_today=losses, open_positions=[position] if position else []))
+                if candidate_provider:
+                    context["detect_candidate"] = candidate_provider
+                decision = app.evaluate_candles(list(m1[pair]), context)
+                reasons["decision_" + decision.reason] += 1
+                if decision.setup is not None:
+                    emit(dict(type="core_decision", now=now, candles=list(m1[pair]),
+                              htf_candles=list(model.h1), risk_state=asdict(state),
+                              decision=asdict(decision), news_policy="skipped"))
+                candidate = dict(decision.setup, **decision.signal) if decision.approved else None
+            elif strategy == "ict_2r" or candidate_provider:
+                context = dict(pair=pair, now=now, htf_candles=list(model.h1), strategy="ict")
                 detector = candidate_provider or app._detect_candidate
                 bars = app._bars(list(m1[pair]), now, timedelta(minutes=1)) if strategy == "ict_2r" else list(m1[pair])
                 candidate = detector(bars, context)
@@ -588,7 +638,8 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 reason = "position_or_reservation_exists"
             elif halted or daily_halt == trading_day_start(now):
                 reason = "account_halted"
-            elif now + timedelta(minutes=config.max_hold_minutes) >= killzone_close(zone, now):
+            elif now + timedelta(minutes=min(10, config.max_hold_minutes) if strategy == "core"
+                                 else config.max_hold_minutes) >= killzone_close(zone, now):
                 reason = "too_late_in_window"
             if reason:
                 reasons[reason] += 1
@@ -598,11 +649,18 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
             emit(dict(type="candidate", now=now, setup=candidate, reason=reason or "pending_next_open"))
         report = dict(strategy=strategy, research_only=True, live_eligible=False,
                       evidence_level="M1 Bid-OHLC screening; real-tick and forward validation required",
-                      execution_model="one position; next-open market; fixed R; time exit; stop-first ambiguity",
+                      execution_model=("one scalp position; next-open Bid/Ask fill; original signal target; time/session exit; stop-first ambiguity; excludes live runner"
+                                       if strategy == "core" else
+                                       "one position; next-open market; fixed R; time exit; stop-first ambiguity"),
                       news_policy="skipped: historical news unavailable", cost_source="explicit assumptions, not verified broker costs",
-                      risk_score_policy="binary research eligibility; not calibrated ICT confluence",
+                      risk_score_policy="shared core confluence and risk engine" if strategy == "core" else
+                                        "binary research eligibility; not calibrated ICT confluence",
+                      core_threshold=threshold if strategy == "core" else None,
                       session_policy="unchanged shared live killzones and risk guards",
-                      pattern_policy=("M5 close beyond prior 12-bar range; first directional M1 close back across within 15min; stop beyond observed breakout extreme"
+                      pattern_policy=("shared brain.app.evaluate_candles; H1 trend / M5 countertrend sweep and confirmed reclaim; exact signal 2R target"
+                                      if strategy == "core" else
+                                      "legacy shared ICT detector; sweep/MSS/FVG; fixed 2R comparison" if strategy == "ict_2r" else
+                                      "M5 close beyond prior 12-bar range; first directional M1 close back across within 15min; stop beyond observed breakout extreme"
                                       if strategy == "failed_breakout" else
                                       "M1 close at least 0.1 ATR beyond prior 30-bar range in shared live killzones; next-open entry; breakout-bar stop capped at ATR20; 1.25R target candidate" if strategy == "stop_cascade_continuation" else
                                       "H1 EMA20/3-bar slope; M5 prior-12 breakout; first reclaim in 15min; ATR14/one-pip stop buffer"),
@@ -806,7 +864,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent / "results")
     parser.add_argument("--threshold", type=int, default=8)
     parser.add_argument("--llm", action="store_true")
-    parser.add_argument("--research", choices=("ict_2r", "breakout_pullback", "failed_breakout"))
+    parser.add_argument("--research", choices=("core", "ict_2r", "breakout_pullback", "failed_breakout", "stop_cascade_continuation"))
     parser.add_argument("--reward-r", type=float, default=2.)
     parser.add_argument("--risk-pct", type=float, default=DEFAULT_RISK_PCT)
     parser.add_argument("--spread-pips", type=float, default=.5)
@@ -822,7 +880,7 @@ def main():
                                 spread_pips=args.spread_pips, slippage_pips=args.slippage_pips,
                                 commission_per_lot=args.commission_per_lot)
         report = research_replay(rows, strategy=args.research, config=config,
-                                 results_path=args.output_dir / "research.jsonl")
+                                 results_path=args.output_dir / "research.jsonl", threshold=args.threshold)
         write_report(args.output_dir / "research.json", report)
         logger.info("Research screening only: metrics=%s monthly=%s", report["metrics"], report["monthly"])
         return

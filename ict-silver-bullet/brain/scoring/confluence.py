@@ -10,6 +10,14 @@ FACTOR_POINTS = {
     "fvg_present_unmitigated": 1,
     "entry_in_ote_zone": 1,
 }
+RECLAIM_FACTOR_POINTS = {
+    "htf_trend_aligned": 2,
+    "inside_killzone": 2,
+    "countertrend_sweep_reclaimed": 2,
+    "executable_2r_geometry": 2,
+    "efficient_htf_trend": 1,
+    "strong_confirmation_body": 1,
+}
 
 
 def score_setup(factors: dict, no_high_impact_news_next_15min: bool | None = None) -> dict:
@@ -23,8 +31,12 @@ def score_setup(factors: dict, no_high_impact_news_next_15min: bool | None = Non
     if not factors.get("inside_killzone", False):
         reason = "outside_killzone"
     else:
+        strategy = factors.get("strategy", "ict")
+        weights = RECLAIM_FACTOR_POINTS if strategy == "trend_reclaim" else FACTOR_POINTS
         breakdown = {name: points if factors.get(name, False) else 0
-                     for name, points in FACTOR_POINTS.items()}
+                     for name, points in weights.items()}
+        if strategy not in {"ict", "trend_reclaim"}:
+            reason = "unknown_strategy"
         if no_high_impact_news_next_15min is None:
             no_high_impact_news_next_15min = factors.get("no_high_impact_news_next_15min", False)
         if not no_high_impact_news_next_15min:

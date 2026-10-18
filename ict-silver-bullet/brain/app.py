@@ -8,7 +8,7 @@ import time
 
 from brain.config import load_config
 from brain.db import supabase_client as db
-from brain.detection import fvg, liquidity, mss, order_block, ote, swings
+from brain.detection import fvg, liquidity, mss, order_block, ote, swings, trend_reclaim
 from brain.llm import reasoning
 from brain.logging_setup import setup_logging
 from brain.news import blackout
@@ -57,7 +57,8 @@ def _bars(candles, now, duration):
     # indices; live and replay share normalization to avoid look-ahead.
     rows = sorted((dict(c) for c in candles if _timestamp(c["ts"]) + duration <= now),
                   key=lambda c: _timestamp(c["ts"]))
-    return [dict(c, index=i, **{k: float(c[k]) for k in ("open", "high", "low", "close")})
+    return [dict(c, index=i, ts=_timestamp(c["ts"]),
+                 **{k: float(c[k]) for k in ("open", "high", "low", "close")})
             for i, c in enumerate(rows)]
 
 
@@ -73,6 +74,21 @@ def _ema(values, period):
 
 
 def _detect_candidate(candles, context):
+    strategy = context.get("strategy", trend_reclaim.STRATEGY)
+    if strategy == "ict":
+        return _detect_ict_candidate(candles, context)
+    if strategy != trend_reclaim.STRATEGY:
+        raise ValueError("unknown core strategy")
+    if not candles or (_timestamp(candles[-1]["ts"]) + timedelta(minutes=1)).minute % 5:
+        return None
+    zone = killzone_clock.current_killzone(context["now"])
+    if zone and context["now"] + timedelta(minutes=10) >= killzone_clock.killzone_close(zone, context["now"]):
+        return None
+    htf = _bars(context["htf_candles"], context["now"], timedelta(hours=1))
+    return trend_reclaim.detect(candles, htf, context["pair"], context["now"])
+
+
+def _detect_ict_candidate(candles, context):
     htf = _bars(context["htf_candles"], context["now"], timedelta(hours=1))
     if len(candles) < 16 or len(htf) < HTF_SLOW_EMA:
         return None
@@ -201,12 +217,18 @@ def evaluate_candles(candles, context) -> PipelineDecision:
     next_event = min(upcoming, key=lambda e: _timestamp(e["scheduled_at"]), default=None)
     # NOTE: Account performance remains explicitly unknown to the LLM until
     # its verdict passes, preserving the required veto-before-account-read gate.
+    displacement = setup.get("confirmation", setup.get("mss", {})).get("displacement", 0)
+    gap = setup.get("fvg", {})
     llm_context = dict(pair=context["pair"], htf_bias=setup["htf_bias"], killzone_name=zone,
-        sweep_description=str(setup["sweep"]), displacement_pips=setup["mss"]["displacement"] / spec["pip_size"],
-        displacement_atr_ratio=setup["mss"]["displacement"] / setup["atr"],
-        fvg_top=setup["fvg"]["top"], fvg_bottom=setup["fvg"]["bottom"],
-        ote_overlap_bool=factors["entry_in_ote_zone"], mechanical_score=score["score"],
-        candles_summary=str(candles[-20:]), recent_headlines=context.get("recent_headlines", []),
+        sweep_description=str(setup["sweep"]), displacement_pips=displacement / spec["pip_size"],
+        displacement_atr_ratio=displacement / setup["atr"],
+        fvg_top=gap.get("top", "not used by this strategy"),
+        fvg_bottom=gap.get("bottom", "not used by this strategy"),
+        ote_overlap_bool=factors.get("entry_in_ote_zone", "not used by this strategy"),
+        mechanical_score=score["score"],
+        candles_summary=str(dict(strategy=setup.get("strategy", "ict"),
+                                 evidence=setup.get("evidence", {}), candles=candles[-20:])),
+        recent_headlines=context.get("recent_headlines", []),
         next_event_name=next_event.get("title", "unnamed") if next_event else "none in news window",
         next_event_minutes_until=(_timestamp(next_event["scheduled_at"]) - now).total_seconds() / 60 if next_event else None,
         realized_r_today="unknown until risk stage", daily_dd_used="unknown until risk stage",

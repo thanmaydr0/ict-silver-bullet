@@ -78,6 +78,65 @@ def target_feasibility(risk_pct=.0025, trades_per_day=4, trading_days=20, target
                 interpretation="constant net R at every trade; not a return forecast; fewer trades or variability change requirements")
 
 
+def core_walk_forward(rows, split, *, output_dir=None, config=None,
+                      thresholds=(8, 9, 10), min_tune_trades=100, simulations=10000):
+    """Freeze the real core rules, sweep only early scores, diagnose one winner.
+
+    Previously examined history remains development data. The later diagnostic
+    and doubled-friction run cannot select or retune a model. No live promotion.
+    """
+    config = config or ResearchConfig(max_hold_minutes=30)
+    tune, later = split_history(rows, split)
+    thresholds = tuple(thresholds)
+    if (not tune or not later or not thresholds or any(t not in (8, 9, 10) for t in thresholds)
+            or min_tune_trades < 1 or simulations < 1 or config.reward_r != 2.):
+        raise ValueError("nonempty periods, score thresholds 8..10, positive sample floor and 2R required")
+    output = Path(output_dir) if output_dir else None
+    specification = dict(strategy="trend_reclaim", split=timestamp(split), thresholds=thresholds,
+        config=asdict(config), min_tune_trades=min_tune_trades, simulations=simulations,
+        data_status="previously examined history; later period is retrospective, not fresh out-of-sample",
+        decision_model="shared brain.app.evaluate_candles with mechanical review bypass",
+        execution_limits="M1 Bid OHLC; one scalp position; no live runner; next-open fill; time stop at session close",
+        news_policy="skipped: historical calendar unavailable", live_eligible=False)
+    if output:
+        write_report(output / "frozen_specification.json", specification)
+    sweep = []
+    for threshold in thresholds:
+        report = research_replay(tune, strategy="core", config=config, threshold=threshold,
+            results_path=output / f"tune_{threshold}.jsonl" if output else None)
+        if output:
+            write_report(output / f"tune_{threshold}.json", report)
+        sweep.append(dict(threshold=threshold, metrics=report["metrics"], monthly=report["monthly"],
+                          max_drawdown_pct=report["max_drawdown_pct"], halted=report["halted"]))
+    eligible = [r for r in sweep if r["metrics"]["trades"] >= min_tune_trades
+                and r["metrics"]["expectancy_r"] > 0 and not r["halted"]]
+    result = dict(specification=specification, sweep=sweep, chosen_threshold=None,
+                  validation=None, stress=None, monte_carlo=None, live_eligible=False,
+                  reason="no_positive_core_tune_threshold_with_sufficient_trades")
+    if eligible:
+        chosen = max(eligible, key=lambda r: (r["metrics"]["expectancy_r"], r["threshold"]))["threshold"]
+        result["chosen_threshold"] = chosen
+        for name, settings in (("validation", config), ("stress", replace(config,
+                spread_pips=2*config.spread_pips, slippage_pips=2*config.slippage_pips,
+                commission_per_lot=2*config.commission_per_lot))):
+            report = research_replay(CandleHistory(tune+later), strategy="core", config=settings,
+                threshold=chosen, decision_start=split,
+                results_path=output / f"{name}.jsonl" if output else None)
+            if output:
+                write_report(output / f"{name}.json", report)
+            result[name] = {k: v for k, v in report.items() if k != "trades"}
+            if name == "validation" and report["trades"]:
+                from backtest.monte_carlo import simulate
+                result["monte_carlo"] = simulate(report["trades"], simulations=simulations,
+                                                risk_pct=config.risk_pct, seed=20261018)
+                if output:
+                    write_report(output / "monte_carlo.json", result["monte_carlo"])
+        result["reason"] = "retrospective_diagnostic_only; real-tick and fresh forward evidence still required"
+    if output:
+        write_report(output / "summary.json", result)
+    return result
+
+
 def screen_research(rows, split, *, output_dir=None, config=None, min_tune_trades=100,
                     min_complete_months=6, candidate_providers=None):
     """Five declared hypotheses, no tuning on later candles, no live promotion.
@@ -141,6 +200,7 @@ def main():
     parser.add_argument("--thresholds", default="7,8,9,10")
     parser.add_argument("--llm", action="store_true")
     parser.add_argument("--research", action="store_true")
+    parser.add_argument("--core", action="store_true", help="cost-aware shared-core experiment")
     parser.add_argument("--risk-pct", type=float, default=.0025)
     parser.add_argument("--spread-pips", type=float, default=.5)
     parser.add_argument("--slippage-pips", type=float, default=.1)
@@ -148,6 +208,16 @@ def main():
     args = parser.parse_args()
     logger = setup_logging("walk_forward")
     rows = load_history(args.data_dir)
+    if args.core:
+        if args.llm or args.research:
+            parser.error("--core is a separate mechanical-only experiment")
+        result = core_walk_forward(rows, args.split, output_dir=args.output_dir / "core",
+            thresholds=tuple(int(t) for t in args.thresholds.split(",") if int(t) >= 8),
+            config=ResearchConfig(risk_pct=args.risk_pct, spread_pips=args.spread_pips,
+                slippage_pips=args.slippage_pips, commission_per_lot=args.commission_per_lot,
+                max_hold_minutes=30))
+        logger.info("Core chosen=%s; %s", result["chosen_threshold"], result["reason"])
+        return
     if args.research:
         if args.llm:
             parser.error("research screening is mechanical only")

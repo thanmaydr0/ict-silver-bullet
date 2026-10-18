@@ -249,7 +249,7 @@ def test_detection_wires_primitives_and_price_geometry(monkeypatch, bias):
     patch(app.fvg, "detect_fvg", [dict(index=16, top=1.103, bottom=1.101, type=bias)])
     patch(app.order_block, "find_order_block", bars[13])
     patch(app.liquidity, "find_nearest_liquidity_pool", dict(level=1.109 if bullish else 1.094))
-    result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf))
+    result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf, strategy="ict"))
     assert result["direction"] == ("buy" if bullish else "sell")
     assert result["factors"]["liquidity_sweep_before_mss"]
     assert result["factors"]["displacement_ge_1_5x_atr"]
@@ -266,7 +266,7 @@ def test_detection_rejects_nontrending_higher_timeframe(monkeypatch):
         high=1.104, low=1.100, close=1.102) for i in range(20)]
     htf = [dict(ts=NOW - timedelta(hours=51-i), open=1.1, high=1.12,
         low=1.09, close=1.1 + (0.001 if i % 2 else -0.001)) for i in range(50)]
-    assert REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf)) is None
+    assert REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf, strategy="ict")) is None
 
 
 @pytest.mark.parametrize("close", [1.1023, 1.1017])
@@ -283,7 +283,7 @@ def test_detection_rejects_fvg_entry_outside_executor_deviation(close, monkeypat
     monkeypatch.setattr(app.fvg, "detect_fvg", lambda *args: [
         dict(index=16, top=1.103, bottom=1.101, type="bullish")])
     monkeypatch.setattr(app.liquidity, "find_nearest_liquidity_pool", lambda *args, **kwargs: dict(level=1.109))
-    result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf))
+    result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf, strategy="ict"))
     assert result is None
 
 
