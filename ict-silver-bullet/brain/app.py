@@ -21,6 +21,11 @@ from brain.scoring import confluence
 PIPELINE_INTERVAL_SECONDS = 60
 MIN_SETUP_SCORE = 8
 CANDLE_LIMIT = 300
+HTF_FAST_EMA = 20
+HTF_SLOW_EMA = 50
+MAX_ENTRY_DISTANCE_PIPS = 2.0
+MIN_STOP_PIPS = 2.0
+MAX_STOP_ATR = 2.0
 logger = logging.getLogger("brain")
 
 
@@ -56,16 +61,32 @@ def _bars(candles, now, duration):
             for i, c in enumerate(rows)]
 
 
+def _ema(values, period):
+    """Return the last EMA, seeded with the first period's simple average."""
+    if len(values) < period:
+        return None
+    result = sum(values[:period]) / period
+    alpha = 2 / (period + 1)
+    for value in values[period:]:
+        result = alpha * value + (1 - alpha) * result
+    return result
+
+
 def _detect_candidate(candles, context):
     htf = _bars(context["htf_candles"], context["now"], timedelta(hours=1))
-    if len(candles) < 16 or len(htf) < 2:
+    if len(candles) < 16 or len(htf) < HTF_SLOW_EMA:
         return None
-    # NOTE: Bias uses the last two H1 closes; ATR averages 14 true ranges.
-    # Entry uses the latest post-MSS FVG midpoint, stop extends one pip beyond
-    # the sweep, and target uses the nearest untapped opposing liquidity pool.
-    if htf[-1]["close"] == htf[-2]["close"]:
+    # NOTE: Require closed-H1 trend alignment (20/50 EMA and price) to avoid
+    # choosing a bias from a single noisy hourly close. Both EMAs use only the
+    # completed bars passed in by _bars.
+    htf_closes = [c["close"] for c in htf]
+    fast, slow = _ema(htf_closes, HTF_FAST_EMA), _ema(htf_closes, HTF_SLOW_EMA)
+    if fast is None or slow is None:
         return None
-    bias = "bullish" if htf[-1]["close"] > htf[-2]["close"] else "bearish"
+    bias = "bullish" if htf[-1]["close"] > fast > slow else (
+        "bearish" if htf[-1]["close"] < fast < slow else None)
+    if bias is None:
+        return None
     ranges = [max(c["high"] - c["low"], abs(c["high"] - p["close"]),
                   abs(c["low"] - p["close"])) for p, c in zip(candles[:-1], candles[1:])]
     atr = sum(ranges[-14:]) / 14
@@ -89,16 +110,35 @@ def _detect_candidate(candles, context):
     if not sweep or not gaps or target is None:
         return None
     gap = gaps[-1]
+    # NOTE: The order executor enters at the quoted signal price and enforces
+    # a 20-point maximum deviation (about 2 FX pips). Stale FVGs were producing
+    # pending signals the executor could never fill, so require a recent gap
+    # and a current close within that executable band.
+    if candles[-1]["index"] - gap["index"] > 5:
+        return None
     entry = (gap["top"] + gap["bottom"]) / 2
     spec = pair_spec(context["pair"], candles[-1]["close"])
     stop = sweep["wick_extreme"] + (-spec["pip_size"] if bias == "bullish" else spec["pip_size"])
+    risk_distance = abs(entry - stop)
+    if (risk_distance < MIN_STOP_PIPS * spec["pip_size"]
+            or risk_distance > MAX_STOP_ATR * atr
+            or abs(candles[-1]["close"] - entry) > MAX_ENTRY_DISTANCE_PIPS * spec["pip_size"]):
+        return None
+    # NOTE: The executor's scalp leg has a fixed 2R take-profit. Require the
+    # nearest untapped pool to leave at least that much space, then emit the
+    # exact 2R price it validates. Its separate runner still uses an H1 swing.
+    take_profit = entry + (2 * risk_distance if bias == "bullish" else -2 * risk_distance)
+    if (target["level"] < take_profit if bias == "bullish"
+            else target["level"] > take_profit):
+        return None
     end = (max(c["high"] for c in candles[shift["index"]:]) if bias == "bullish"
            else min(c["low"] for c in candles[shift["index"]:]))
     zone = ote.calculate_ote_zone(sweep["wick_extreme"], end)
-    if not (stop < entry < target["level"] if bias == "bullish" else target["level"] < entry < stop):
+    if not (stop < entry < take_profit if bias == "bullish"
+            else take_profit < entry < stop):
         return None
     return dict(pair=context["pair"], direction="buy" if bias == "bullish" else "sell",
-        entry=entry, stop_loss=stop, take_profit=target["level"], htf_bias=bias,
+        entry=entry, stop_loss=stop, take_profit=take_profit, htf_bias=bias,
         sweep=sweep, mss=shift, fvg=gap, order_block=block, atr=atr,
         factors=dict(htf_bias_aligned=True, inside_killzone=True,
             liquidity_sweep_before_mss=sweep["index"] < shift["index"],

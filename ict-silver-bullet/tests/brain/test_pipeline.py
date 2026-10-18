@@ -234,8 +234,8 @@ def test_detection_wires_primitives_and_price_geometry(monkeypatch, bias):
     bullish = bias == "bullish"
     bars = [dict(index=i, ts=NOW - timedelta(minutes=21-i), open=1.102,
         high=1.104, low=1.100, close=1.102) for i in range(20)]
-    htf = [dict(ts=NOW - timedelta(hours=3-i), open=1.10, high=1.12,
-        low=1.09, close=1.1 + (0.01 if bullish else -0.01) * i) for i in range(2)]
+    htf = [dict(ts=NOW - timedelta(hours=51-i), open=1.10, high=1.12,
+        low=1.09, close=1.05 + (0.001 if bullish else -0.001) * i) for i in range(50)]
     pivots = [app.swings.SwingPoint(5, 1.101 if bullish else 1.103,
                                    "low" if bullish else "high")]
     calls = {}
@@ -248,7 +248,7 @@ def test_detection_wires_primitives_and_price_geometry(monkeypatch, bias):
         wick_extreme=1.099 if bullish else 1.105))
     patch(app.fvg, "detect_fvg", [dict(index=16, top=1.103, bottom=1.101, type=bias)])
     patch(app.order_block, "find_order_block", bars[13])
-    patch(app.liquidity, "find_nearest_liquidity_pool", dict(level=1.108 if bullish else 1.096))
+    patch(app.liquidity, "find_nearest_liquidity_pool", dict(level=1.109 if bullish else 1.094))
     result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf))
     assert result["direction"] == ("buy" if bullish else "sell")
     assert result["factors"]["liquidity_sweep_before_mss"]
@@ -256,7 +256,35 @@ def test_detection_wires_primitives_and_price_geometry(monkeypatch, bias):
     assert calls["detect_liquidity_sweep"].call_args.args[0] == bars[:15]
     assert calls["detect_liquidity_sweep"].call_args.args[2] == ("buy_side" if bullish else "sell_side")
     assert result["stop_loss"] < result["entry"] < result["take_profit"] if bullish else result["take_profit"] < result["entry"] < result["stop_loss"]
+    assert abs(result["take_profit"] - result["entry"]) == pytest.approx(
+        2 * abs(result["entry"] - result["stop_loss"]))
     assert all(mocked.call_count == 1 for mocked in calls.values())
+
+
+def test_detection_rejects_nontrending_higher_timeframe(monkeypatch):
+    bars = [dict(index=i, ts=NOW - timedelta(minutes=21-i), open=1.102,
+        high=1.104, low=1.100, close=1.102) for i in range(20)]
+    htf = [dict(ts=NOW - timedelta(hours=51-i), open=1.1, high=1.12,
+        low=1.09, close=1.1 + (0.001 if i % 2 else -0.001)) for i in range(50)]
+    assert REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf)) is None
+
+
+@pytest.mark.parametrize("close", [1.1023, 1.1017])
+def test_detection_rejects_fvg_entry_outside_executor_deviation(close, monkeypatch):
+    bars = [dict(index=i, ts=NOW - timedelta(minutes=21-i), open=1.102,
+        high=1.104, low=1.100, close=1.102) for i in range(20)]
+    bars[-1]["close"] = close
+    htf = [dict(ts=NOW - timedelta(hours=51-i), open=1.10, high=1.12,
+        low=1.09, close=1.05 + 0.001 * i) for i in range(50)]
+    monkeypatch.setattr(app.swings, "find_swing_points", lambda _: [
+        app.swings.SwingPoint(5, 1.101, "low")])
+    monkeypatch.setattr(app.mss, "detect_mss", lambda *args: dict(index=15, level=1.102, displacement=0.007))
+    monkeypatch.setattr(app.liquidity, "detect_liquidity_sweep", lambda *args: dict(index=14, wick_extreme=1.099))
+    monkeypatch.setattr(app.fvg, "detect_fvg", lambda *args: [
+        dict(index=16, top=1.103, bottom=1.101, type="bullish")])
+    monkeypatch.setattr(app.liquidity, "find_nearest_liquidity_pool", lambda *args, **kwargs: dict(level=1.109))
+    result = REAL_DETECT(bars, dict(now=NOW, pair="EURUSD", htf_candles=htf))
+    assert result is None
 
 
 def test_incomplete_candles_never_enter_detection(live):
