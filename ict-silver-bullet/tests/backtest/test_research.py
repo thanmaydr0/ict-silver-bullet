@@ -163,6 +163,23 @@ def test_stop_cascade_uses_completed_range_and_suppresses_same_range_reentry():
         assert model.update_m1(later_break) is None
 
 
+def test_stop_cascade_out_of_session_break_does_not_consume_next_session_signal():
+    model = StopCascadeContinuation()
+    for i in range(30):
+        row = dict(pair="EURUSD", ts=BASE + timedelta(minutes=i), open=1.1,
+                   high=1.1001, low=1.0999, close=1.1)
+        assert model.update_m1(row) is None
+    outside = dict(pair="EURUSD", ts=BASE + timedelta(minutes=30), open=1.1003,
+                   high=1.1005, low=1.1003, close=1.1004)
+    assert model.update_m1(outside, eligible=False) is None
+    assert model.next_eligible_bar == 0
+
+    inside = dict(pair="EURUSD", ts=BASE + timedelta(minutes=31), open=1.1006,
+                  high=1.1008, low=1.10058, close=1.1007)
+    setup = model.update_m1(inside, eligible=True)
+    assert setup["direction"] == "buy"
+
+
 def test_stop_cascade_research_is_labeled_research_only():
     report = research_replay(candles(3), strategy="stop_cascade_continuation")
     assert report["strategy"] == "stop_cascade_continuation"

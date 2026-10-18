@@ -235,11 +235,11 @@ class StopCascadeContinuation:
     def update_h1(self, row):
         return None
 
-    def update_m1(self, row):
+    def update_m1(self, row, *, eligible=True):
         prior = list(self.m1)
         self.m1.append(row)
         self.bars_seen += 1
-        if len(prior) < 30 or self.bars_seen < self.next_eligible_bar:
+        if not eligible or len(prior) < 30 or self.bars_seen < self.next_eligible_bar:
             return None
 
         atr_bars = prior[-20:]
@@ -460,8 +460,12 @@ def research_replay(rows, *, strategy="breakout_pullback", config=None, initial_
                 model.update_h1(row)
                 continue
             m1[pair].append(row)
-            candidate = model.update_m1(row) if strategy in {
-                "breakout_pullback", "failed_breakout", "stop_cascade_continuation"} else None
+            if strategy == "stop_cascade_continuation":
+                eligible = current_killzone(now) is not None and not (start and now < start)
+                candidate = model.update_m1(row, eligible=eligible)
+            else:
+                candidate = model.update_m1(row) if strategy in {
+                    "breakout_pullback", "failed_breakout"} else None
             if start and now < start:
                 continue
             if state.day_start != trading_day_start(now):
