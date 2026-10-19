@@ -58,6 +58,7 @@ def describe(report):
         ambiguous_bars=report['reasons'].get('both_touched',0),
         opening_target_then_stop=report['reasons'].get('open_already_beyond_target_then_stop',0),
         accounting_max_error=max((abs(t['gross']-t['costs']-t['net']) for t in ts),default=0.),
+        risk_flags_seen=';'.join(report['risk_flags_seen']),overall_halt=report['overall_halt'],
         open_position=report['open_position'])
 
 
@@ -139,6 +140,46 @@ def sparse_frames(frames,signals,hold=60,index_cache=None):
     return out
 
 
+def event_cache(frames,indexed):
+    return {symbol:dict(index=indexed[symbol][0],endpoints=indexed[symbol][1],
+        columns={col:frame[col].array if col=='ts' else frame[col].to_numpy() for col in frame})
+        for symbol,frame in frames.items()}
+
+
+def event_stream(cache,signals,activity):
+    """Seek through flat intervals, then yield EVERY original M1 bar while an
+    order is pending or a position is open. The existing engine controls seeking.
+    Daily endpoints preserve zero-trade calendar accounting. No outcome lookup,
+    alternative execution kernel or interpolated data is used.
+    """
+    import numpy as np
+    events=[]; cursors={symbol:0 for symbol in cache}
+    for symbol,c in cache.items():
+        times=np.array([int(ts.timestamp())*10**9 for ts,pair in signals if pair==symbol],dtype='int64')
+        indices=np.unique(np.concatenate((np.searchsorted(c['index'],times),np.flatnonzero(c['endpoints']))))
+        events.extend((int(c['index'][i]),symbol,int(i)) for i in indices if i<len(c['index']))
+    events.sort(); event_cursor=0;previous=(-1,'')
+    while True:
+        while event_cursor<len(events) and events[event_cursor][:2]<=previous:
+            event_cursor+=1
+        if activity.get('active'):
+            choices=[(int(c['index'][cursors[symbol]]),symbol,cursors[symbol])
+                     for symbol,c in cache.items() if cursors[symbol]<len(c['index'])]
+            if not choices: return
+            stamp,symbol,i=min(choices)
+        else:
+            if event_cursor==len(events): return
+            stamp,symbol,i=events[event_cursor]
+            for pair,c in cache.items():
+                k=int(np.searchsorted(c['index'],stamp))
+                if pair<symbol and k<len(c['index']) and c['index'][k]==stamp: k+=1
+                cursors[pair]=max(cursors[pair],k)
+        cursors[symbol]=i+1;previous=(stamp,symbol)
+        row={col:values[i] for col,values in cache[symbol]['columns'].items()}
+        row['ts']=row['ts'].to_pydatetime()
+        yield row
+
+
 def random_pool(frames):
     """Uniform times/pairs within each actual London/NY decision session.
     Same causal prior ATR20, five-pip floor, 120-bar contiguous warmup.
@@ -197,7 +238,9 @@ def main():
     first=min(aware(a['first']) for a in audit);end=max(aware(a['last']) for a in audit)+timedelta(minutes=1)
     ledger=root/'reports/trials_ledger.csv'
     indexed=sparse_index(frames)
-    protocol=dict(seeds=args.seeds,seed_range=[0,args.seeds-1],risk=.00001,initial=1000000.,
+    cached=event_cache(frames,indexed)
+    protocol=dict(seeds=args.seeds,seed_range=[0,args.seeds-1],risk=.000001,initial=10000000.,
+        resolution_account=dict(risk=.0005,initial=10000.),
         r_basis='original signal price-stop distance; excludes all fees',
         null_times='one uniform actual timestamp/pair per London/NY session per trading day; independent uniform direction',
         null_selection='fixed seed list, all results retained, no best seed',
@@ -210,18 +253,19 @@ def main():
         if previous!=protocol: raise ValueError('diagnostic protocol changed; do not silently resume')
     write_json(output/'protocol.json',protocol)
 
-    def execute(name,spec,signals,mode='full',policy='stop_first',charts=True):
+    def execute(name,spec,signals,mode='full',policy='stop_first',charts=True,screening=False):
         folder=output/name; saved=folder/'diagnostic.json'
         if saved.exists(): return json.loads(saved.read_text())
         settings=DiagnosticCosts(mode=mode)
+        risk,initial=(.0005,10000.) if screening else (.000001,10000000.)
         entry=trial(folder,spec,settings,'label_utc',first.isoformat(),end.isoformat(),
-            'DIAGNOSTIC',ledger,risk=.00001,extra=dict(name=name,ambiguity=policy,initial=1000000.))
+            'DIAGNOSTIC',ledger,risk=risk,extra=dict(name=name,ambiguity=policy,initial=initial))
         log.info('START %s',name)
         try:
-            subset=sparse_frames(frames,signals,spec.hold_minutes,indexed)
-            rep=run(stream(subset),spec,costs=settings,risk=.00001,initial=1000000.,
+            activity={}
+            rep=run(event_stream(cached,signals,activity),spec,costs=settings,risk=risk,initial=initial,
                     start=first,end=end,candidate=lambda r:signals.get((r['ts'],r['pair'])),
-                    ambiguity=policy,retain_marks=charts)
+                    ambiguity=policy,retain_marks=charts,activity=activity)
             if rep['open_position']: raise ValueError('position remains at end of real data')
             stat=describe(rep)
             if stat['accounting_max_error']>1e-6: raise ValueError('cash accounting identity failed')
@@ -265,7 +309,7 @@ def main():
     for minutes,scale in ((1,1.),(5,3.),(15,6.)):
         signals=tape(frames,spec,minutes,scale)
         for mode in ('zero','full'):
-            d=execute(f'resolution/M{minutes}_{mode}',spec,signals,mode)
+            d=execute(f'resolution/M{minutes}_{mode}',spec,signals,mode,screening=True)
             resolution.append(dict(minutes=minutes,stop_scale=scale,mode=mode,**d))
             table(output/'resolution',resolution)
     spread_rows=[]
@@ -311,7 +355,7 @@ def main():
     report=['# Existing-engine diagnostic results',
         'Previously examined history; conditional UTC labels; modelled spreads; no historical news calendar. No new strategy or promotion.',
         'R uses original signal price-stop distance. Earlier fee-inclusive R remains in CSV as engine_average_r.',
-        'Small diagnostic risk (0.001%, initial $1,000,000) limits lifetime risk censoring; not a risk recommendation.',
+        'Small diagnostic risk (0.0001%, initial $10,000,000; about $10 loss budget per trade) limits lifetime risk censoring; not a capital or risk recommendation. The resolution-account monthly tables use the original $10,000 and 0.05% screening risk. Risk flags and overall halts are explicitly reported.',
         '## 1. Paired cost attribution, identical full-cost executed trades',
         (output/'gross_net_same_trades.md').read_text(),
         '## 1b. Actual counterfactual reruns (entry geometry and trade sets can change)',(output/'cost_reruns.md').read_text(),

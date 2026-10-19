@@ -13,7 +13,7 @@ from brain.news.blackout import is_in_news_blackout
 
 def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
         end=None, news_events=(), news_complete=False, candidate=None,
-        ambiguity='stop_first', retain_marks=True):
+        ambiguity='stop_first', retain_marks=True, activity=None):
     if ambiguity not in ('stop_first','target_first','open_direction'):
         raise ValueError('unknown intrabar ambiguity rule')
     costs = costs or Costs()
@@ -31,12 +31,14 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
     last_seen, previous_global = {}, None
     observed_months = set()
     risk_clock, busy_until = None, None
+    risk_flags_seen=set()
 
     def sample(now, equity):
         # M1 bounds have no known intrabar timestamp. Assign all bounds in a
         # minute to its close; both symbols share this risk observation clock.
         clock = risk_clock or now
         flags = state.mark(equity, clock)
+        risk_flags_seen.update(k for k in ('soft_daily','soft_overall','hard_daily','hard_overall') if flags[k])
         if position:
             base = state.balance+position['entry_commission']
             position['path_r'].append((equity-base)/position['risk_usd'])
@@ -187,11 +189,14 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
                 pending[symbol] = signal
         elif blocked:
             reasons['news_blackout'] += 1
+        if activity is not None:
+            activity['active']=bool(position or pending)
     if position:
         # NOTE: Never close at a future bar or fabricate an end-boundary quote.
         reasons['unclosed_at_boundary'] += 1
     return dict(trades=trades, marks=marks, costs_ledger=ledger, initial=initial,
                 final_balance=state.balance, open_position=position is not None,
+                risk_flags_seen=sorted(risk_flags_seen),overall_halt=state.overall_halt,
                 months=sorted(observed_months), reasons=dict(reasons),
                 news_complete=news_complete, spread_source='recorded pips when present; otherwise MODELLED',
                 intrabar_model=f'{ambiguity}; floating costs included',

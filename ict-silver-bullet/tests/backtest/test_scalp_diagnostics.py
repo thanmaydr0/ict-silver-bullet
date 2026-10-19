@@ -59,7 +59,11 @@ def test_sparse_null_stream_matches_full_existing_engine(tmp_path):
     full=run(stream(source),spec,candidate=candidate)
     sparse=run(stream(sparse_frames(source,signals)),spec,candidate=candidate)
     compact=run(stream(sparse_frames(source,signals)),spec,candidate=candidate,retain_marks=False)
-    assert full['trades']==sparse['trades']==compact['trades']
+    from backtest.scalp_diagnostics import sparse_index,event_cache,event_stream
+    activity={}
+    event=run(event_stream(event_cache(source,sparse_index(source)),signals,activity),
+              spec,candidate=candidate,activity=activity)
+    assert full['trades']==sparse['trades']==compact['trades']==event['trades']
     assert full['final_balance']==sparse['final_balance']==compact['final_balance']
     assert not compact['open_position']
 
@@ -71,6 +75,30 @@ def test_random_controls_are_reproducible_direction_independent():
     assert first==random_tape(pool,17,2.)
     assert next(iter(first.values()))['reference_distance']==.0005
     assert {next(iter(random_tape(pool,i,2.).values()))['sign'] for i in range(20)}=={-1,1}
+
+
+def test_event_seek_matches_full_two_symbol_replay_with_gaps_and_breakers():
+    import pandas as pd
+    from backtest.scalp_diagnostics import sparse_index,event_cache,event_stream
+    from backtest.scalp_study import stream
+    data=rows(400)
+    for i,row in enumerate(data):
+        if i%20==2: row.update(open=1.095,high=1.103,low=1.094)
+    frames={'EURUSD':pd.DataFrame(data),
+            'GBPUSD':pd.DataFrame([dict(b,pair='GBPUSD') for i,b in enumerate(data) if i not in (42,43)])}
+    signals={}
+    for symbol,f in frames.items():
+        for row in stream({symbol:f}):
+            if row['ts'].minute%20==0:
+                signals[(row['ts'],symbol)]=dict(sign=1,stop=1.099,target=1.102,
+                    reference_distance=.001,decision_at=row['ts']+timedelta(minutes=1),regime='unit')
+    callback=lambda r:signals.get((r['ts'],r['pair']))
+    spec=Specification('compression');activity={}
+    full=run(stream(frames),spec,candidate=callback,risk=.005)
+    fast=run(event_stream(event_cache(frames,sparse_index(frames)),signals,activity),
+             spec,candidate=callback,risk=.005,activity=activity)
+    assert full['trades']==fast['trades'] and full['final_balance']==fast['final_balance']
+    assert any(m['soft_daily'] for m in full['marks'])
 
 
 def test_m5_tape_is_causal_and_has_no_incomplete_aggregate_signal():
