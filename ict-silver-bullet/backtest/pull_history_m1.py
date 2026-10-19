@@ -19,6 +19,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -307,6 +308,214 @@ def _pull_available_rates(mt5: Any, symbol: str, chunk_bars: int):
     return pd.concat(chunks, ignore_index=True)
 
 
+def _rates_frame(rates, symbol: str):
+    import pandas as pd
+
+    names = getattr(getattr(rates, "dtype", None), "names", None)
+    if names is not None:
+        missing = [name for name in RATE_COLUMNS if name not in names]
+        if missing:
+            raise RuntimeError(f"MT5 rates for {symbol} are missing columns: {', '.join(missing)}")
+    frame = pd.DataFrame.from_records(rates)
+    missing = [name for name in RATE_COLUMNS if name not in frame.columns]
+    if missing:
+        raise RuntimeError(f"MT5 rates for {symbol} are missing columns: {', '.join(missing)}")
+    frame = frame.loc[:, RATE_COLUMNS].copy()
+    frame["time"] = pd.to_numeric(frame["time"], errors="raise").astype("int64")
+    return frame
+
+
+def _staged_chunk_paths(staging_dir: Path) -> list[Path]:
+    return sorted(staging_dir.glob("chunk-*.parquet"))
+
+
+def _write_staged_chunk(frame, staging_dir: Path, chunk_number: int) -> Path:
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    path = staging_dir / f"chunk-{chunk_number:08d}.parquet"
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        frame.to_parquet(temporary, index=False, engine="pyarrow")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return path
+
+
+def _load_checkpoint(path: Path, symbol: str, chunk_bars: int) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "symbol": symbol,
+            "chunk_bars": chunk_bars,
+            "mode": "position",
+            "next_start_pos": 0,
+            "cursor_time": None,
+            "chunk_count": 0,
+            "complete": False,
+        }
+    checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    if checkpoint.get("symbol") != symbol:
+        raise RuntimeError(f"Staging checkpoint at {path} belongs to another symbol.")
+    # The position cursor is a count of already fetched rows, so changing the
+    # request size between attempts is safe. Keep the current value for logs.
+    checkpoint["chunk_bars"] = chunk_bars
+    return checkpoint
+
+
+def _rates_summary_from_staging(symbol: str, staging_dir: Path) -> dict[str, Any] | None:
+    import numpy as np
+    import pandas as pd
+
+    paths = _staged_chunk_paths(staging_dir)
+    if not paths:
+        return None
+    time_chunks = []
+    rows = 0
+    staged_files = []
+    for path in paths:
+        frame = pd.read_parquet(path, columns=["time"])
+        values = frame["time"].to_numpy(dtype="int64", copy=False)
+        if len(values):
+            time_chunks.append(values)
+        rows += len(frame)
+        staged_files.append({
+            "file": path.relative_to(DATA_DIR).as_posix(),
+            "row_count": len(frame),
+            "sha256": _sha256(path),
+        })
+    unique_times = np.unique(np.concatenate(time_chunks))
+    gaps = np.diff(unique_times)
+    gap_intervals = gaps[gaps > 60]
+    return {
+        "symbol": symbol,
+        "first_timestamp": int(unique_times[0]),
+        "last_timestamp": int(unique_times[-1]),
+        "row_count": len(unique_times),
+        "staged_row_count_including_duplicates": rows,
+        "duplicate_rows_removed_on_finalize": rows - len(unique_times),
+        "gap_count": int(len(gap_intervals)),
+        "missing_m1_bars_between_observed_rows": int(np.maximum(0, gap_intervals // 60 - 1).sum()),
+        "largest_gap_seconds": int(gap_intervals.max()) if len(gap_intervals) else 0,
+        "staging_files": staged_files,
+        "staging_status": "incomplete; rerun to resume or inspect staged files",
+    }
+
+
+def _pull_rates_to_staging(mt5: Any, symbol: str, chunk_bars: int, staging_dir: Path) -> dict[str, Any]:
+    """Persist each MT5 chunk and resume from an atomic on-disk checkpoint."""
+    checkpoint_path = staging_dir / "checkpoint.json"
+    checkpoint = _load_checkpoint(checkpoint_path, symbol, chunk_bars)
+    if checkpoint.get("complete"):
+        return checkpoint
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    chunk_number = int(checkpoint.get("chunk_count", 0))
+    if _staged_chunk_paths(staging_dir):
+        # A chunk is replaced on retry if a process stopped between writing
+        # its parquet file and advancing the checkpoint.
+        chunk_number = max(chunk_number, len(_staged_chunk_paths(staging_dir)))
+    mode = checkpoint.get("mode", "position")
+    next_start_pos = int(checkpoint.get("next_start_pos", 0))
+    cursor_time = checkpoint.get("cursor_time")
+
+    while mode == "position":
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, next_start_pos, chunk_bars)
+        if rates is None:
+            paths = _staged_chunk_paths(staging_dir)
+            if not paths or not callable(getattr(mt5, "copy_rates_range", None)):
+                raise RuntimeError(
+                    f"MT5 M1 read failed for {symbol} at position {next_start_pos}: {mt5.last_error()}"
+                )
+            import pandas as pd
+            latest_chunk = pd.read_parquet(paths[-1], columns=["time"])
+            cursor_time = int(latest_chunk["time"].min())
+            mode = "range"
+            checkpoint.update({"mode": mode, "cursor_time": cursor_time})
+            _atomic_json(checkpoint_path, checkpoint)
+            logger.warning(
+                "%s: position read failed at %d; continuing backward with copy_rates_range from raw time %d",
+                symbol, next_start_pos, cursor_time,
+            )
+            break
+        count = len(rates)
+        if count == 0:
+            break
+        frame = _rates_frame(rates, symbol)
+        oldest = int(frame["time"].min())
+        newest = int(frame["time"].max())
+        if cursor_time is not None and oldest >= int(cursor_time):
+            raise RuntimeError(f"MT5 did not move backward for {symbol}; stopping to avoid a position loop.")
+        _write_staged_chunk(frame, staging_dir, chunk_number)
+        chunk_number += 1
+        next_start_pos += count
+        cursor_time = oldest
+        checkpoint.update({
+            "mode": mode,
+            "next_start_pos": next_start_pos,
+            "cursor_time": cursor_time,
+            "chunk_count": chunk_number,
+            "complete": count < chunk_bars,
+        })
+        _atomic_json(checkpoint_path, checkpoint)
+        logger.info(
+            "%s: saved chunk %d (%d bars), next position %d, raw time %d..%d",
+            symbol, chunk_number, count, next_start_pos, oldest, newest,
+        )
+        if count < chunk_bars:
+            return checkpoint
+
+    while mode == "range":
+        if cursor_time is None:
+            raise RuntimeError(f"Cannot resume range history for {symbol}: checkpoint has no raw-time cursor.")
+        range_start = int(cursor_time) - chunk_bars * 60
+        range_end = int(cursor_time) - 1
+        rates = mt5.copy_rates_range(
+            symbol,
+            mt5.TIMEFRAME_M1,
+            datetime.fromtimestamp(range_start, timezone.utc),
+            datetime.fromtimestamp(range_end, timezone.utc),
+        )
+        if rates is None:
+            raise RuntimeError(
+                f"MT5 M1 range read failed for {symbol} before raw time {cursor_time}: {mt5.last_error()}"
+            )
+        if len(rates) == 0:
+            checkpoint.update({"mode": mode, "chunk_count": chunk_number, "complete": True})
+            _atomic_json(checkpoint_path, checkpoint)
+            return checkpoint
+        frame = _rates_frame(rates, symbol)
+        frame = frame.loc[frame["time"] < int(cursor_time)]
+        if frame.empty:
+            checkpoint.update({"mode": mode, "chunk_count": chunk_number, "complete": True})
+            _atomic_json(checkpoint_path, checkpoint)
+            return checkpoint
+        oldest = int(frame["time"].min())
+        newest = int(frame["time"].max())
+        if oldest >= int(cursor_time):
+            raise RuntimeError(f"MT5 range read did not move backward for {symbol}; stopping to avoid a loop.")
+        _write_staged_chunk(frame, staging_dir, chunk_number)
+        chunk_number += 1
+        cursor_time = oldest
+        checkpoint.update({"mode": mode, "cursor_time": cursor_time, "chunk_count": chunk_number})
+        _atomic_json(checkpoint_path, checkpoint)
+        logger.info(
+            "%s: saved range chunk %d (%d bars), next raw-time cursor %d, range %d..%d",
+            symbol, chunk_number, len(frame), cursor_time, oldest, newest,
+        )
+
+    checkpoint.update({"mode": mode, "chunk_count": chunk_number, "complete": True})
+    _atomic_json(checkpoint_path, checkpoint)
+    return checkpoint
+
+
+def _read_staged_rates(staging_dir: Path):
+    import pandas as pd
+
+    paths = _staged_chunk_paths(staging_dir)
+    if not paths:
+        return pd.DataFrame(columns=RATE_COLUMNS)
+    return pd.concat([pd.read_parquet(path, columns=list(RATE_COLUMNS)) for path in paths], ignore_index=True)
+
+
 def _gap_stats(raw_times: list[int]) -> dict[str, int]:
     ordered = sorted(int(value) for value in raw_times)
     gaps = [later - earlier for earlier, later in zip(ordered, ordered[1:]) if later - earlier > 60]
@@ -351,7 +560,7 @@ def _write_symbol_bars(symbol: str, frame, data_dir: Path = DATA_DIR) -> dict[st
     for year, annual in frame.groupby(year_values, sort=True):
         annual = annual.loc[:, RATE_COLUMNS].sort_values("time", kind="stable").reset_index(drop=True)
         year = int(year)
-        path = M1_DIR / f"{_safe_filename(symbol)}_{year}.parquet"
+        path = data_dir / "m1" / f"{_safe_filename(symbol)}_{year}.parquet"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
@@ -439,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
     initialized = False
     failures: dict[str, dict[str, str]] = {}
     completed: list[dict[str, Any]] = []
+    partial_symbols: list[dict[str, Any]] = []
     symbol_clock_observations: dict[str, list[dict[str, Any]]] = {}
     symbol_info_files: dict[str, dict[str, str]] = {}
     run_id = f"m1-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
@@ -462,10 +672,15 @@ def main(argv: list[str] | None = None) -> int:
                     "sha256": _sha256(metadata_path),
                 }
 
-                frame = _pull_available_rates(mt5, symbol, args.chunk_bars)
+                staging_dir = M1_DIR / ".staging" / _safe_filename(symbol)
+                checkpoint = _pull_rates_to_staging(mt5, symbol, args.chunk_bars, staging_dir)
+                if not checkpoint.get("complete"):
+                    raise RuntimeError(f"MT5 history staging did not complete for {symbol}.")
+                frame = _read_staged_rates(staging_dir)
                 if frame.empty:
                     raise RuntimeError(f"No M1 history returned for {symbol}; check broker history and Max bars in chart.")
                 summary = _write_symbol_bars(symbol, frame)
+                shutil.rmtree(staging_dir)
                 observations.append(_observe_server_offset(mt5, symbol))
                 # Refresh metadata so the final offset sample is included and hashed.
                 metadata["clock_observations"] = observations
@@ -477,6 +692,11 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 logger.exception("M1 history export failed for %s", symbol)
                 failures[symbol] = {"error_type": type(exc).__name__, "error": str(exc)}
+                staging_dir = M1_DIR / ".staging" / _safe_filename(symbol)
+                staged_summary = _rates_summary_from_staging(symbol, staging_dir)
+                if staged_summary is not None:
+                    staged_summary["staging_directory"] = staging_dir.relative_to(DATA_DIR).as_posix()
+                    partial_symbols.append(staged_summary)
 
         clock_metadata = _history_clock_metadata([
             {"symbol": symbol, **observation}
@@ -490,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
             "schema_version": 1,
             "run_id": run_id,
             "generated_at_utc": _utc_now_iso(),
-            "status": "complete" if not failures else ("partial" if completed else "failed"),
+            "status": "complete" if not failures else ("partial" if completed or partial_symbols else "failed"),
             "config_sha256": config_digest,
             "timeframe": "M1",
             "account_type": account_type,
@@ -500,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
             "gap_count_definition": "number of adjacent observed rows separated by more than 60 seconds; includes session/weekend closures",
             "clock": clock_metadata,
             "symbols": completed,
+            "partial_symbols": partial_symbols,
             "failed_symbols": failures,
         }
         _atomic_json(MANIFEST_PATH, manifest)

@@ -84,6 +84,74 @@ def test_position_chunks_walk_backward_and_keep_raw_columns():
     assert frame["time"].tolist() == [180, 240, 60, 120, 0]
 
 
+def test_staged_history_falls_back_to_ranges_and_resumes_without_redownloading(tmp_path, monkeypatch):
+    monkeypatch.setattr(history, "DATA_DIR", tmp_path)
+    calls = {"positions": [], "ranges": []}
+
+    class Terminal:
+        TIMEFRAME_M1 = 1
+
+        @staticmethod
+        def copy_rates_from_pos(symbol, timeframe, start_pos, count):
+            calls["positions"].append(start_pos)
+            if start_pos == 0:
+                return rate_rows([180, 240])
+            return None
+
+        @staticmethod
+        def copy_rates_range(symbol, timeframe, start, end):
+            calls["ranges"].append((int(start.timestamp()), int(end.timestamp())))
+            if len(calls["ranges"]) == 1:
+                return rate_rows([60, 120])
+            if len(calls["ranges"]) == 2:
+                return rate_rows([0])
+            return np.empty(0, dtype=RATE_DTYPE)
+
+        @staticmethod
+        def last_error():
+            return (-1, "Terminal: Call failed")
+
+    staging_dir = tmp_path / "m1" / ".staging" / "EURUSD"
+    checkpoint = history._pull_rates_to_staging(Terminal(), "EURUSD", 2, staging_dir)
+
+    assert checkpoint["complete"] is True
+    assert checkpoint["mode"] == "range"
+    assert calls["positions"] == [0, 2]
+    assert len(calls["ranges"]) == 3
+    assert history._read_staged_rates(staging_dir)["time"].tolist() == [180, 240, 60, 120, 0]
+
+    second_call = history._pull_rates_to_staging(Terminal(), "EURUSD", 2, staging_dir)
+    assert second_call["complete"] is True
+    assert calls["positions"] == [0, 2]
+    assert len(calls["ranges"]) == 3
+
+
+def test_failed_staged_read_retains_checkpoint_and_partial_file_hashes(tmp_path, monkeypatch):
+    monkeypatch.setattr(history, "DATA_DIR", tmp_path)
+
+    class Terminal:
+        TIMEFRAME_M1 = 1
+
+        @staticmethod
+        def copy_rates_from_pos(symbol, timeframe, start_pos, count):
+            return rate_rows([120, 180]) if start_pos == 0 else None
+
+        @staticmethod
+        def last_error():
+            return (-1, "Terminal: Call failed")
+
+    staging_dir = tmp_path / "m1" / ".staging" / "EURUSD"
+    with pytest.raises(RuntimeError, match="position 2"):
+        history._pull_rates_to_staging(Terminal(), "EURUSD", 2, staging_dir)
+
+    partial = history._rates_summary_from_staging("EURUSD", staging_dir)
+    assert partial["row_count"] == 2
+    assert partial["staging_files"][0]["sha256"] == history._sha256(staging_dir / "chunk-00000000.parquet")
+    saved_checkpoint = history.json.loads((staging_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    assert saved_checkpoint["next_start_pos"] == 2
+    assert saved_checkpoint["complete"] is False
+
+
 def test_yearly_parquet_keeps_raw_time_and_hashes_files(tmp_path, monkeypatch):
     monkeypatch.setattr(history, "M1_DIR", tmp_path / "m1")
     monkeypatch.setattr(history, "DATA_DIR", tmp_path)
