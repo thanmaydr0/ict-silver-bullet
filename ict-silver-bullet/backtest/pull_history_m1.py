@@ -123,6 +123,24 @@ def _connect(mt5: Any, settings: dict[str, Any]) -> None:
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
 
 
+def _require_demo_server(settings: dict[str, Any]) -> None:
+    server = str(settings.get("server", "")).casefold()
+    if not any(marker in server for marker in ("demo", "paper", "trial")):
+        raise RuntimeError("Refusing to initialize MT5: MT5_SERVER must identify a demo server.")
+
+
+def _require_demo_account(mt5: Any) -> str:
+    account = mt5.account_info()
+    if account is None:
+        raise RuntimeError("Cannot verify MT5 account type; refusing to export without demo confirmation.")
+    fields = account._asdict() if hasattr(account, "_asdict") else {}
+    trade_mode = fields.get("trade_mode", getattr(account, "trade_mode", None))
+    demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
+    if trade_mode != demo_mode:
+        raise RuntimeError("Refusing to export: connected MT5 account is not confirmed as demo.")
+    return "demo"
+
+
 def _json_safe(value: Any) -> Any:
     if hasattr(value, "_asdict"):
         return {str(key): _json_safe(item) for key, item in value._asdict().items()}
@@ -405,6 +423,7 @@ def main(argv: list[str] | None = None) -> int:
     global logger
     logger = setup_logging("pull-history-m1")
     settings = _load_settings(args.symbols)
+    _require_demo_server(settings)
     try:
         import pandas as pd
 
@@ -426,6 +445,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _connect(mt5, settings)
         initialized = True
+        account_type = _require_demo_account(mt5)
         for symbol in settings["symbols"]:
             observations: list[dict[str, Any]] = []
             symbol_clock_observations[symbol] = observations
@@ -473,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
             "status": "complete" if not failures else ("partial" if completed else "failed"),
             "config_sha256": config_digest,
             "timeframe": "M1",
+            "account_type": account_type,
             "chunk_bars": args.chunk_bars,
             "timestamp_unit": "Unix seconds, as returned in MT5 rate.time",
             "partition_year_basis": "raw epoch interpreted as UTC calendar year; stored time values are unchanged",

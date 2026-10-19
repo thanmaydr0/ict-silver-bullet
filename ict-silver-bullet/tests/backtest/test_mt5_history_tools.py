@@ -5,6 +5,7 @@ import time as time_module
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from backtest import pull_calendar_probe as calendar_probe
 from backtest import pull_history_m1 as history
@@ -29,6 +30,26 @@ def test_symbols_are_deduplicated_and_validated():
         assert "Invalid MT5 symbol" in str(exc)
     else:
         raise AssertionError("unsafe symbol must be rejected")
+
+
+def test_all_mt5_tools_reject_unverified_or_live_accounts():
+    for module in (history, ticks_probe, calendar_probe):
+        module._require_demo_server({"server": "Broker-Demo"})
+        with pytest.raises(RuntimeError, match="must identify a demo server"):
+            module._require_demo_server({"server": "Broker-Live"})
+
+        demo_terminal = SimpleNamespace(
+            ACCOUNT_TRADE_MODE_DEMO=0,
+            account_info=lambda: SimpleNamespace(trade_mode=0),
+        )
+        assert module._require_demo_account(demo_terminal) == "demo"
+
+        live_terminal = SimpleNamespace(
+            ACCOUNT_TRADE_MODE_DEMO=0,
+            account_info=lambda: SimpleNamespace(trade_mode=2),
+        )
+        with pytest.raises(RuntimeError, match="not confirmed as demo"):
+            module._require_demo_account(live_terminal)
 
 
 def test_gap_count_includes_long_intervals_without_filling_bars():

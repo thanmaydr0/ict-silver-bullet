@@ -65,6 +65,24 @@ def _connect(mt5: Any, settings: dict[str, Any]) -> None:
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
 
 
+def _require_demo_server(settings: dict[str, Any]) -> None:
+    server = str(settings.get("server", "")).casefold()
+    if not any(marker in server for marker in ("demo", "paper", "trial")):
+        raise RuntimeError("Refusing to initialize MT5: MT5_SERVER must identify a demo server.")
+
+
+def _require_demo_account(mt5: Any) -> str:
+    account = mt5.account_info()
+    if account is None:
+        raise RuntimeError("Cannot verify MT5 account type; refusing to probe without demo confirmation.")
+    fields = account._asdict() if hasattr(account, "_asdict") else {}
+    trade_mode = fields.get("trade_mode", getattr(account, "trade_mode", None))
+    demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
+    if trade_mode != demo_mode:
+        raise RuntimeError("Refusing to probe: connected MT5 account is not confirmed as demo.")
+    return "demo"
+
+
 def _last_completed_wednesday(now: datetime) -> date:
     days_back = (now.weekday() - 2) % 7
     if days_back == 0 and now.time() < time(12, 0):
@@ -206,6 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     global logger
     logger = setup_logging("pull-ticks-probe")
     settings = _load_settings()
+    _require_demo_server(settings)
     mt5 = importlib.import_module("MetaTrader5")
     initialized = False
     results = []
@@ -215,6 +234,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _connect(mt5, settings)
         initialized = True
+        account_type = _require_demo_account(mt5)
         for symbol in SYMBOLS:
             try:
                 results.append(_probe_symbol(mt5, symbol, anchor, args.max_years, args.probe_hours))
@@ -230,6 +250,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "schema_version": 1,
             "generated_at_utc": _utc_iso(datetime.now(timezone.utc)),
+            "account_type": account_type,
             "status": "complete" if not failures else ("partial" if results else "failed"),
             "config_sha256": hashlib.sha256(json.dumps(config, sort_keys=True).encode("utf-8")).hexdigest(),
             "probe_anchor_wednesday": anchor.isoformat(),

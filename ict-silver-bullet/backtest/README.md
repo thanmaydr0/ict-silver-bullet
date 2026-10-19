@@ -5,12 +5,14 @@ Run these on the Windows EC2 host with the MT5 terminal open and logged in to th
 From the `ict-silver-bullet` project root, use a Python environment with the backtest dependencies and MT5 client installed:
 
 ```powershell
-.\backtest\.venv\Scripts\Activate.ps1
-python -m pip install -r backtest/requirements.txt MetaTrader5 python-dotenv
+.\executor\.venv\Scripts\Activate.ps1
+python -m pip install -r backtest/requirements.txt python-dotenv
 python -m backtest.pull_history_m1
 python -m backtest.pull_ticks_probe
 python -m backtest.pull_calendar_probe
 ```
+
+The scripts require `MT5_SERVER` to identify a demo, paper, or trial server and verify `account_info().trade_mode` is demo before querying history. They refuse any account they cannot confirm as demo.
 
 Before the full M1 export, set MT5 **Max bars in chart** high enough and let the terminal download the symbol history. The export reads backward in 50,000-bar chunks; use `--chunk-bars` to change the chunk size or `--symbols` to override `TRADED_PAIRS` for one run.
 

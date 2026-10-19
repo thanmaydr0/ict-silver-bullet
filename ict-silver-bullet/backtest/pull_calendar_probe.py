@@ -66,6 +66,24 @@ def _connect(mt5: Any, settings: dict[str, Any]) -> None:
         raise RuntimeError(f"MT5 initialization failed: {mt5.last_error()}")
 
 
+def _require_demo_server(settings: dict[str, Any]) -> None:
+    server = str(settings.get("server", "")).casefold()
+    if not any(marker in server for marker in ("demo", "paper", "trial")):
+        raise RuntimeError("Refusing to initialize MT5: MT5_SERVER must identify a demo server.")
+
+
+def _require_demo_account(mt5: Any) -> str:
+    account = mt5.account_info()
+    if account is None:
+        raise RuntimeError("Cannot verify MT5 account type; refusing to probe without demo confirmation.")
+    fields = account._asdict() if hasattr(account, "_asdict") else {}
+    trade_mode = fields.get("trade_mode", getattr(account, "trade_mode", None))
+    demo_mode = getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
+    if trade_mode != demo_mode:
+        raise RuntimeError("Refusing to probe: connected MT5 account is not confirmed as demo.")
+    return "demo"
+
+
 def _utc_iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -411,15 +429,18 @@ def main(argv: list[str] | None = None) -> int:
     global logger
     logger = setup_logging("pull-calendar-probe")
     settings = _load_settings()
+    _require_demo_server(settings)
     mt5 = importlib.import_module("MetaTrader5")
     initialized = False
     try:
         _connect(mt5, settings)
         initialized = True
+        account_type = _require_demo_account(mt5)
         result = probe_calendar(mt5, args.max_years)
         result.update({
             "schema_version": 1,
             "generated_at_utc": _utc_iso(datetime.now(timezone.utc)),
+            "account_type": account_type,
             "max_years": args.max_years,
         })
         _write_json(OUTPUT_PATH, result)
