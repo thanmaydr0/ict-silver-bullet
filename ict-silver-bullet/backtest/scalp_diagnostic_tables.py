@@ -90,6 +90,9 @@ def main():
         dict(check='zero-cost symmetric win %',observed=symmetric['mean_win_pct'],reference='approximately 50; finite holding exits included'),
         dict(check='zero-cost symmetric barrier-only win %',observed=symmetric['mean_barrier_win_pct'],reference='approximately 50; inspect ambiguity bias')])
     emit('table_3_engine_checks',checks)
+    if (output/'clock_scenario_closures.json').exists():
+        clock_rows=json.loads((output/'clock_scenario_closures.json').read_text())
+        emit('table_3_clock_closures',[{k:r[k] for k in ('symbol','scenario','weekly_gaps','ends_1655_to_1700_NY')} for r in clock_rows])
     resolution=read('resolution.csv');emit('table_6_resolution',[
         {k:(number(r,k) if k not in ('mode','risk_flags_seen','overall_halt') else r[k]) for k in
          ('minutes','stop_scale','mode','trades','net_r','profit_factor','average_stop_pips','cost_r','risk_flags_seen','overall_halt')}
@@ -121,6 +124,13 @@ def main():
         'Null distributions condition on this historical market path. Empirical seed intervals are not fresh market confidence intervals. Smallest tail fraction with 200 seeds is 1/201. Four-family Bonferroni diagnostics are shown; these do not repair prior data reuse. ICT geometry is not matched by an ATR-stop null, so no ICT null p-value is asserted.']
     for title,name in sections:
         text.extend(['## '+title,(output/(name+'.md')).read_text()])
+    if (output/'table_3_clock_closures.md').exists():
+        text.extend(['## Source-clock diagnosis',(output/'table_3_clock_closures.md').read_text(),
+            'Weekly closures strongly favor a UTC+2/+3 European-DST server-clock interpretation over the stored UTC label. This is closure-based inference, not broker certification or a selection using profits. Intended-session conclusions under the UTC label remain invalid until provenance is resolved.',
+            'MetaQuotes documents that chart history uses broker server time: https://www.mql5.com/en/book/common/timing/timing_local_server . A primary market-hours reference lists the Friday close near 17:00 New York: https://www.oanda.com/us-en/trading/hours-of-operation/ . Neither document alone proves the timezone of this export.'])
+    if (output/'clock_ablation.md').exists():
+        text.extend(['## Frozen-logic clock sensitivity',(output/'clock_ablation.md').read_text(),
+            'This additional comparison keeps the already frozen family and rules unchanged and changes only the closure-inferred source-clock interpretation. It does not select a timezone by its return, restore an independent holdout, or authorize integration.'])
     text.extend(['## 7. Attribution',
         'The tables above separate measured cost drag, gross expectancy, null-relative performance and ordering bias. The written verdict must distinguish a detectable statistical difference from an economically usable edge. No result can certify the intended New York sessions while source-clock mapping is unverified.',
         'Original-engine parity on an actual 96-trade historical prefix passed, as did 33 unit tests. Faster replay never substitutes another execution kernel: it skips flat/no-order intervals and processes every M1 bar while pending/open. No source prices were generated or interpolated.',
