@@ -187,6 +187,7 @@ def random_pool(frames):
     Same causal prior ATR20, five-pip floor, 120-bar contiguous warmup.
     """
     import numpy as np
+    import pandas as pd
     pool=defaultdict(list)
     for symbol,f in frames.items():
         ts=f.ts
@@ -199,11 +200,12 @@ def random_pool(frames):
             local=decisions.dt.tz_convert(zone)
             minute=local.dt.hour*60+local.dt.minute
             keep=contiguous & (minute>=8*60+15) & (minute<10*60) & (local.dt.weekday<5)
-            for i in np.flatnonzero(keep.to_numpy()):
-                now=decisions.iloc[i].to_pydatetime()
+            selected=pd.DataFrame(dict(ts=ts,close=f.close,atr=atr,day=local.dt.date)).loc[keep]
+            for stamp,close,prior_atr,day in selected.itertuples(index=False,name=None):
+                observed=stamp.to_pydatetime()
+                now=observed+timedelta(minutes=1)
                 if not market_open(now): continue
-                pool[(name,str(local.iloc[i].date()))].append((ts.iloc[i].to_pydatetime(),symbol,
-                    float(f.close.iloc[i]),max(.0005,1.5*float(atr.iloc[i]))))
+                pool[(name,str(day))].append((observed,symbol,float(close),max(.0005,1.5*float(prior_atr))))
     return pool
 
 

@@ -13,7 +13,7 @@ from brain.news.blackout import is_in_news_blackout
 
 def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
         end=None, news_events=(), news_complete=False, candidate=None,
-        ambiguity='stop_first', retain_marks=True, activity=None):
+        ambiguity='stop_first', retain_marks=True, activity=None, retain_paths=True):
     if ambiguity not in ('stop_first','target_first','open_direction'):
         raise ValueError('unknown intrabar ambiguity rule')
     costs = costs or Costs()
@@ -39,17 +39,20 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
         clock = risk_clock or now
         flags = state.mark(equity, clock)
         risk_flags_seen.update(k for k in ('soft_daily','soft_overall','hard_daily','hard_overall') if flags[k])
-        if position:
+        if position and retain_paths:
             base = state.balance+position['entry_commission']
             position['path_r'].append((equity-base)/position['risk_usd'])
+        if not retain_marks:
+            # Keep only the liquidation value needed by the second symbol in
+            # this minute. All limits/peaks still update above on every bound.
+            marks[:]=[dict(equity=equity)]
+            return flags
         stamp = clock.isoformat()
         if (not position and marks and marks[-1]['equity'] == equity
                 and marks[-1]['balance'] == state.balance
                 and marks[-1]['fx_day'] == str(fx_day(clock))
                 and marks[-1]['ts'][:13] == stamp[:13]):
             return flags
-        if not retain_marks and marks:
-            marks.clear()
         marks.append(dict(ts=stamp, equity=equity, balance=state.balance,
                           fx_day=str(fx_day(clock)), **flags))
         return flags
@@ -78,7 +81,7 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
             spread_cost=spread_paid, slippage_cost=slip_paid, commission=commission,
             risk_usd=p['risk_usd'], r=net/p['risk_usd'], reason=reason, regime=p['regime'],
             minimum_r=p['minimum_pnl']/p['risk_usd'], maximum_r=p['maximum_pnl']/p['risk_usd']))
-        trades[-1]['path_r'] = p['path_r']+[net/p['risk_usd']]
+        trades[-1]['path_r'] = p['path_r']+[net/p['risk_usd']] if retain_paths else []
         position = None
         busy_until = now
         sample(now, state.balance)
@@ -194,7 +197,7 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
     if position:
         # NOTE: Never close at a future bar or fabricate an end-boundary quote.
         reasons['unclosed_at_boundary'] += 1
-    return dict(trades=trades, marks=marks, costs_ledger=ledger, initial=initial,
+    return dict(trades=trades, marks=marks if retain_marks else [], costs_ledger=ledger, initial=initial,
                 final_balance=state.balance, open_position=position is not None,
                 risk_flags_seen=sorted(risk_flags_seen),overall_halt=state.overall_halt,
                 months=sorted(observed_months), reasons=dict(reasons),

@@ -5,6 +5,7 @@ OHLC and latency allowances are conditional models, never a no-breach guarantee.
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from math import isfinite
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 NY = ZoneInfo('America/New_York')
@@ -18,11 +19,13 @@ def aware(value):
     return value.astimezone(UTC)
 
 
+@lru_cache(maxsize=65536)
 def fx_day(now):
     local = aware(now).astimezone(NY)
     return (local - timedelta(hours=17)).date()
 
 
+@lru_cache(maxsize=65536)
 def market_open(now):
     local = aware(now).astimezone(NY)
     minute = local.hour * 60 + local.minute
@@ -45,6 +48,7 @@ class Costs:
         if not 1 <= self.latency_seconds <= 3:
             raise ValueError('retail latency must be between 1 and 3 seconds')
 
+    @lru_cache(maxsize=65536)
     def spread(self, symbol, now, recorded=None, news=False):
         if symbol not in ('EURUSD', 'GBPUSD'):
             raise ValueError('this study supports only the original USD-quoted pairs')

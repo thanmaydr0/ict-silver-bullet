@@ -101,6 +101,14 @@ def test_event_seek_matches_full_two_symbol_replay_with_gaps_and_breakers():
              spec,candidate=callback,risk=.005,activity=activity)
     assert full['trades']==fast['trades'] and full['final_balance']==fast['final_balance']
     assert any(m['soft_daily'] for m in full['marks'])
+    activity={}
+    lean=run(event_stream(event_cache(frames,sparse_index(frames)),signals,activity),
+             spec,candidate=callback,risk=.005,activity=activity,retain_marks=False,retain_paths=False)
+    without_paths=lambda r:[{k:v for k,v in t.items() if k!='path_r'} for t in r['trades']]
+    assert without_paths(full)==without_paths(lean)
+    assert full['risk_flags_seen']==lean['risk_flags_seen']
+    assert full['overall_halt']==lean['overall_halt']
+    assert lean['marks']==[] and all(t['path_r']==[] for t in lean['trades'])
 
 
 def test_m5_tape_is_causal_and_has_no_incomplete_aggregate_signal():
