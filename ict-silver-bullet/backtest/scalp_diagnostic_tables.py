@@ -146,6 +146,9 @@ def main():
     if (output/'clock_ablation.md').exists():
         text.extend(['## Frozen-logic clock sensitivity',(output/'clock_ablation.md').read_text(),
             'This additional comparison keeps the already frozen family and rules unchanged and changes only the closure-inferred source-clock interpretation. It does not select a timezone by its return, restore an independent holdout, or authorize integration.'])
+    if (output/'clock_resolution.md').exists():
+        text.extend(['## Resolution under the closure-aligned clock',(output/'clock_resolution.md').read_text(),
+            'Monthly tables/charts under clock_ablation/M5_zero, M5_full, M15_zero and M15_full use the same $10,000 screening account and M1 fills as the stored-label resolution comparison.'])
     text.extend(['## 7. Attribution',
         'The tables above separate measured cost drag, gross expectancy, null-relative performance and ordering bias. The written verdict must distinguish a detectable statistical difference from an economically usable edge. No result can certify the intended New York sessions while source-clock mapping is unverified.',
         'Original-engine parity on an actual 96-trade historical prefix passed, as did 33 unit tests. Faster replay never substitutes another execution kernel: it skips flat/no-order intervals and processes every M1 bar while pending/open. No source prices were generated or interpolated.',
