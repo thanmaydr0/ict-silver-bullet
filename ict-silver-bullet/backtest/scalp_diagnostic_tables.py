@@ -12,8 +12,6 @@ from backtest.scalp_study import write_json
 def main():
     root=Path(__file__).resolve().parents[1]
     output=root/'reports/diagnostics'
-    if not (output/'complete.json').exists():
-        raise ValueError('diagnostic batch is not complete')
     def read(name):
         with (output/name).open(newline='',encoding='utf-8') as f:
             return list(csv.DictReader(f))
@@ -24,6 +22,23 @@ def main():
     def emit(name,rows):
         rows=[{k:fmt(v) for k,v in row.items()} for row in rows]
         table(output/name,rows);return rows
+    if not (output/'complete.json').exists():
+        # Report-only recovery for a zero-trade baseline: verify all requested
+        # simulations finished; never rerun prices or fabricate completion.
+        required={'cost_reruns.csv':20,'bar_ordering.csv':15,'resolution.csv':6,'null_seeds.csv':1000}
+        for name,count in required.items():
+            if not (output/name).exists() or len(read(name))!=count:
+                raise ValueError('diagnostic simulation batch is not complete: '+name)
+        null_rows=read('null_seeds.csv')
+        if len({(r['seed'],r['control']) for r in null_rows})!=1000:
+            raise ValueError('duplicate/missing null seed controls')
+        ledger=root/'reports/trials_ledger.csv'
+        with ledger.open(newline='',encoding='utf-8') as f:
+            diagnostic=[r for r in csv.DictReader(f) if r['stage']=='DIAGNOSTIC']
+        if len(diagnostic)!=1036 or any(r['status']!='COMPLETE' for r in diagnostic):
+            raise ValueError('trial ledger does not confirm 1036 completed diagnostic runs')
+        write_json(output/'complete.json',dict(status='COMPLETE',seeds=200,
+            report_only_recovery='verified 1036 finished simulations; zero-trade baseline summary handling corrected'))
     families=('opening_range','failed_breakout','mean_reversion','compression','ict_baseline')
     costs=read('cost_reruns.csv'); indexed={(x['family'],x['mode']):x for x in costs}
     paired={x['family']:x for x in read('gross_net_same_trades.csv')}
@@ -61,11 +76,11 @@ def main():
         for mode in ('zero','full'):
             xs=[number(r,'net_r') for r in ns if r['control']==f'{mode}_R{reward:g}']
             actual=number(indexed[family,mode],'net_r')
-            p=(1+sum(x>=actual for x in xs))/(len(xs)+1)
+            p=(1+sum(x>=actual for x in xs))/(len(xs)+1) if actual is not None else None
             row.update({mode+'_real_R':actual,mode+'_null_mean_R':mean(xs),
                 mode+'_upper_tail_p':p if family!='ict_baseline' else None,
-                mode+'_bonferroni_4_p':min(1.,4*p) if family!='ict_baseline' else None,
-                mode+'_above_null_p975':actual>quantile(xs,.975) if family!='ict_baseline' else None})
+                mode+'_bonferroni_4_p':min(1.,4*p) if family!='ict_baseline' and p is not None else None,
+                mode+'_above_null_p975':actual>quantile(xs,.975) if family!='ict_baseline' and actual is not None else None})
         row['matching']='ATR/minimum-stop, reward-matched session null' if family!='ict_baseline' else 'ICT structural stops differ; p-values not asserted'
         comparisons.append(row)
     emit('table_2_real_vs_null',comparisons)
@@ -78,7 +93,7 @@ def main():
         bounds.append(dict(family=family,trades=int(stop['trades']),
             ambiguous_trades=int(stop['ambiguous_trades']),share_pct=number(stop,'ambiguous_share_pct'),
             stop_first_R=number(stop,'net_r'),target_first_R=target,open_direction_R=heuristic,
-            target_first_delta_R=target-number(stop,'net_r'),
+            target_first_delta_R=target-number(stop,'net_r') if target is not None else None,
             opening_target_then_stop=int(stop['opening_target_then_stop'])))
     emit('table_4_bar_bounds',bounds)
     checks=[dict(check='cash accounting max |gross-costs-net| USD',observed=max(number(r,'accounting_max_error') for r in costs+ns),reference='0 within floating-point tolerance'),

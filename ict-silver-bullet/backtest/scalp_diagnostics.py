@@ -356,8 +356,8 @@ def main():
         label=f'full_R{specs[family].reward:g}'
         xs=[r['net_r'] for r in null if r['control']==label]
         comparison.append(dict(family=family,real_net_r=d['net_r'],null_mean_r=mean(xs),
-            empirical_upper_tail_p=(1+sum(x>=d['net_r'] for x in xs))/(len(xs)+1),
-            above_null_p975=d['net_r']>quantile(xs,.975),
+            empirical_upper_tail_p=(1+sum(x>=d['net_r'] for x in xs))/(len(xs)+1) if d['net_r'] is not None else None,
+            above_null_p975=d['net_r']>quantile(xs,.975) if d['net_r'] is not None else None,
             comparability=f'{label} uniform session null; ICT setup geometry differs'))
     table(output/'real_vs_null',comparison)
     write_json(output/'complete.json',dict(status='COMPLETE',seeds=args.seeds,counts=Counter(r['control'] for r in null)))
