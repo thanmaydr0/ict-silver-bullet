@@ -208,3 +208,23 @@ def test_sharp_parameter_peak_is_rejected_without_retuning():
     for i,c in enumerate(cells):
         if i!=4: c['average_r']=.01
     assert not robustness(cells,1.5,1.5)['passed']
+
+
+@pytest.mark.parametrize('unit', ['ns', 'us', 'ms'])
+def test_minute_grid_is_independent_of_timestamp_storage_unit(tmp_path, monkeypatch, unit):
+    import hashlib
+    import pandas as pd
+    import backtest.scalp_study as study
+    frame = pd.DataFrame(rows(3))
+    frame['ts'] = pd.Series(pd.DatetimeIndex(frame['ts']).as_unit(unit))
+    path = tmp_path / 'EURUSD_M1.parquet'
+    def save_fixture():
+        frame.to_parquet(path, index=False)
+        monkeypatch.setattr(study, 'SOURCE_SHA256', {path.name: hashlib.sha256(path.read_bytes()).hexdigest()})
+    save_fixture()
+    _, audit = study.read_data(tmp_path, 'label_utc')
+    assert audit[0]['rows'] == 3
+    frame['ts'] += pd.Timedelta(seconds=1)
+    save_fixture()
+    with pytest.raises(ValueError, match='M1 grid'):
+        study.read_data(tmp_path, 'label_utc')

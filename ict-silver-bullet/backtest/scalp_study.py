@@ -96,7 +96,7 @@ def read_data(folder, clock):
             raise ValueError('naive timestamps: explicit provenance needed')
         if ts.isna().any() or ts.duplicated().any() or not ts.is_monotonic_increasing:
             raise ValueError('missing, duplicate or out-of-order source timestamps')
-        if ((ts.astype('int64') % (60*10**9)) != 0).any():
+        if ((ts.dt.second != 0) | (ts.dt.microsecond != 0) | (ts.dt.nanosecond != 0)).any():
             raise ValueError('source is not on the M1 grid')
         symbol=name.split('_')[0]
         if set(frame['pair']) != {symbol}:

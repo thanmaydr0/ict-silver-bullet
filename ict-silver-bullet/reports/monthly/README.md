@@ -1,8 +1,7 @@
 # Monthly validation artifacts
 
 No historical backtest has been run in this request. This directory deliberately
-contains no invented monthly returns or charts. The existing price exports still
-need to be transferred from EC2; see `../data_handoff.md`.
+contains no invented monthly returns or charts. The study executes on EC2 beside the existing prices; see `../data_handoff.md`.
 
 `backtest.scalp_walkforward` writes a separate subdirectory for every logged tune,
 validation, stress, baseline and sensitivity run. Each includes `summary.csv`,
