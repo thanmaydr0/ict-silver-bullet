@@ -12,7 +12,10 @@ from brain.news.blackout import is_in_news_blackout
 
 
 def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
-        end=None, news_events=(), news_complete=False, candidate=None):
+        end=None, news_events=(), news_complete=False, candidate=None,
+        ambiguity='stop_first', retain_marks=True):
+    if ambiguity not in ('stop_first','target_first','open_direction'):
+        raise ValueError('unknown intrabar ambiguity rule')
     costs = costs or Costs()
     if not isfinite(initial) or initial <= 0:
         raise ValueError('positive finite capital required')
@@ -43,6 +46,8 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
                 and marks[-1]['fx_day'] == str(fx_day(clock))
                 and marks[-1]['ts'][:13] == stamp[:13]):
             return flags
+        if not retain_marks and marks:
+            marks.clear()
         marks.append(dict(ts=stamp, equity=equity, balance=state.balance,
                           fx_day=str(fx_day(clock)), **flags))
         return flags
@@ -63,6 +68,10 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
                            +costs.slip()*10*p['lots'], kind='spread_slippage'))
         trades.append(dict(symbol=p['symbol'], opened_at=p['opened'].isoformat(),
             lots=p['lots'],
+            sign=p['sign'], entry_bid=p['entry_bid'], stop=p['stop'], target=p['target'],
+            reference_r_usd=p['reference_distance']*p['units'],
+            stop_distance_pips=p['reference_distance']/.0001,
+            ambiguous=p['ambiguous'], ambiguity_policy=ambiguity,
             closed_at=now.isoformat(), net=net, gross=gross_ex_cost, costs=spread_paid+slip_paid+commission,
             spread_cost=spread_paid, slippage_cost=slip_paid, commission=commission,
             risk_usd=p['risk_usd'], r=net/p['risk_usd'], reason=reason, regime=p['regime'],
@@ -123,6 +132,8 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
                     entry_bid=row['open'], opened=now, risk_usd=lots*loss_per_lot,
                     spread_paid=spread*10*lots if p['sign'] > 0 else 0,
                     entry_commission=fee, minimum_pnl=-fee, maximum_pnl=-fee)
+                position['reference_distance']=p.get('reference_distance',abs(row['open']-p['stop']))
+                position['ambiguous']=False
                 position['path_r'] = []
                 counts[fx_day(now)] += 1
                 ledger.append(dict(ts=now.isoformat(), amount=fee, kind='commission'))
@@ -137,13 +148,30 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
             adverse = (row['low'] if p['sign'] > 0 else row['high'])+extra
             favourable = (row['high'] if p['sign'] > 0 else row['low'])+extra
             stopped = (adverse-p['stop'])*p['sign'] <= 0
+            targeted = (favourable-p['target'])*p['sign'] >= 0
+            both = stopped and targeted
+            position['ambiguous'] |= both
+            if both:
+                reasons['both_touched'] += 1
+            # Alternative ordering is diagnostic only. The open-direction
+            # heuristic assumes O-L-H-C for an up/doji bar, O-H-L-C otherwise.
+            first_is_target = both and (opening-p['stop'])*p['sign']>0 and (ambiguity=='target_first' or (
+                ambiguity=='open_direction' and
+                ((row['close']<row['open']) == (p['sign']>0))))
             exit_adverse = (min(opening,p['stop']) if p['sign'] > 0 else max(opening,p['stop'])) if stopped else adverse
+            if first_is_target:
+                exit_adverse=opening
+            if both and (opening-p['target'])*p['sign']>=0:
+                reasons['open_already_beyond_target_then_stop'] += 1
             def floating(quote):
                 return (quote-p['entry'])*p['sign']*p['units']-p['entry_commission']-costs.commission*p['lots']/2-costs.slip()*10*p['lots']
             worst = floating(exit_adverse)
             p['minimum_pnl'] = min(p['minimum_pnl'], worst)
             flags = sample(now, state.balance+p['entry_commission']+worst)
-            if stopped:
+            if first_is_target:
+                p['maximum_pnl']=max(p['maximum_pnl'],floating(p['target']))
+                close(p['target']-extra,spread,decision_time,'target_ambiguous')
+            elif stopped:
                 close(exit_adverse-extra, spread, decision_time, 'stop')
             elif state.daily_halt or state.overall_halt:
                 close(adverse-extra, spread, decision_time, 'risk_flatten')
@@ -166,6 +194,6 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
                 final_balance=state.balance, open_position=position is not None,
                 months=sorted(observed_months), reasons=dict(reasons),
                 news_complete=news_complete, spread_source='recorded pips when present; otherwise MODELLED',
-                intrabar_model='open/adverse/favourable/close; stop-first; floating costs included',
+                intrabar_model=f'{ambiguity}; floating costs included',
                 latency_model=f'{costs.latency_seconds}s assumed; next-open plus adverse pip allowance',
                 live_eligible=False)

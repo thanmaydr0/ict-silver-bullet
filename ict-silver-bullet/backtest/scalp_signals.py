@@ -30,8 +30,11 @@ class Specification:
 
 
 class Detector:
-    def __init__(self, spec):
+    def __init__(self, spec, bar_minutes=1):
         self.spec = spec
+        if bar_minutes not in (1,5,15):
+            raise ValueError('supported diagnostic resolutions are M1/M5/M15')
+        self.bar_minutes = bar_minutes
         self.bars = deque(maxlen=121)
         self.or_bars = {}
         self.used_open = set()
@@ -39,8 +42,8 @@ class Detector:
 
     def update(self, bar):
         """bar.ts is OPEN time; decision is at bar.ts + one minute."""
-        now = aware(bar['ts']) + timedelta(minutes=1)
-        if self.bars and aware(bar['ts']) != aware(self.bars[-1]['ts']) + timedelta(minutes=1):
+        now = aware(bar['ts']) + timedelta(minutes=self.bar_minutes)
+        if self.bars and aware(bar['ts']) != aware(self.bars[-1]['ts']) + timedelta(minutes=self.bar_minutes):
             self.bars.clear()
             self.or_bars.clear()
         prior = list(self.bars)
@@ -75,7 +78,7 @@ class Detector:
         family = self.spec.family
         if family == 'opening_range':
             window = self.or_bars.get(session, [])
-            if len(window) == 15 and session not in self.used_open:
+            if len(window) == 15//self.bar_minutes and session not in self.used_open:
                 hi, lo = max(x['high'] for x in window), min(x['low'] for x in window)
                 sign = 1 if closes[-1] <= hi < c else -1 if closes[-1] >= lo > c else 0
                 if sign:
