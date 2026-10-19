@@ -22,6 +22,28 @@ def main():
     def emit(name,rows):
         rows=[{k:fmt(v) for k,v in row.items()} for row in rows]
         table(output/name,rows);return rows
+    if all((output/f'null_worker_{i}_complete.json').exists() for i in (0,1)):
+        combined=read('null_worker_0.csv')+read('null_worker_1.csv')
+        if len(combined)!=1000 or len({(r['seed'],r['control']) for r in combined})!=1000:
+            raise ValueError('worker null coverage is incomplete')
+        table(output/'null_seeds',sorted(combined,key=lambda r:(int(r['seed']),r['control'])))
+        ledger=root/'reports/trials_ledger.csv'
+        with ledger.open(newline='',encoding='utf-8') as f:
+            reader=csv.DictReader(f);fields=reader.fieldnames;entries=list(reader)
+        ids={r['trial_id'] for r in entries}
+        paths=[output/f'null_worker_{i}_trials.csv' for i in (0,1)]
+        paths.append(output/'clock_ablation/trials_ledger.csv')
+        for path in paths:
+            if not path.exists():continue
+            with path.open(newline='',encoding='utf-8') as f:
+                for entry in csv.DictReader(f):
+                    if entry['status']!='COMPLETE':raise ValueError('unfinished auxiliary trial ledger')
+                    if entry['trial_id'] not in ids:
+                        entries.append(entry);ids.add(entry['trial_id'])
+        temp=ledger.with_suffix('.merge.tmp')
+        with temp.open('w',newline='',encoding='utf-8') as f:
+            writer=csv.DictWriter(f,fieldnames=fields);writer.writeheader();writer.writerows(entries)
+        temp.replace(ledger)
     if not (output/'complete.json').exists():
         # Report-only recovery for a zero-trade baseline: verify all requested
         # simulations finished; never rerun prices or fabricate completion.
@@ -35,10 +57,10 @@ def main():
         ledger=root/'reports/trials_ledger.csv'
         with ledger.open(newline='',encoding='utf-8') as f:
             diagnostic=[r for r in csv.DictReader(f) if r['stage']=='DIAGNOSTIC']
-        if len(diagnostic)!=1036 or any(r['status']!='COMPLETE' for r in diagnostic):
+        if sum(r['status']=='COMPLETE' for r in diagnostic)!=1036 or any(r['status'] not in ('COMPLETE','INTERRUPTED_MECHANICAL_RESTART') for r in diagnostic):
             raise ValueError('trial ledger does not confirm 1036 completed diagnostic runs')
         write_json(output/'complete.json',dict(status='COMPLETE',seeds=200,
-            report_only_recovery='verified 1036 finished simulations; zero-trade baseline summary handling corrected'))
+            report_only_recovery='verified 1036 finished simulations; deterministic workers merged and zero-trade baseline summary handling corrected'))
     families=('opening_range','failed_breakout','mean_reversion','compression','ict_baseline')
     costs=read('cost_reruns.csv'); indexed={(x['family'],x['mode']):x for x in costs}
     paired={x['family']:x for x in read('gross_net_same_trades.csv')}
