@@ -1,6 +1,6 @@
 """One frozen-logic clock ablation, chosen from closures, never from profits.
 
-Run after the main diagnostic worker exits, to keep ledger writes sequential.
+Uses a separate ledger/output, so it can run independently of the main worker.
 """
 from datetime import timedelta
 import json
@@ -15,8 +15,6 @@ from brain.logging_setup import setup_logging
 
 def main():
     root=Path(__file__).resolve().parents[1];output=root/'reports/diagnostics'
-    if not (output/'complete.json').exists():
-        raise ValueError('main diagnostic must finish before this clock ablation')
     log=setup_logging('scalp-clock-diagnostic')
     spec=Specification(**json.loads((root/'reports/frozen_holdout_receipt.json').read_text())['strategy'])
     rows=[]
@@ -27,6 +25,7 @@ def main():
     # broker provenance. Existing prices, rules and risk allocation stay fixed.
     frames,audit=read_data(root/'backtest/data/validation_20261018','broker_eu')
     folder=output/'clock_ablation';folder.mkdir(parents=True,exist_ok=True)
+    ledger=folder/'trials_ledger.csv'
     write_json(folder/'protocol.json',dict(reason='156/156 weekly closes per pair align near 17:00 NY under EU-server interpretation; 0/156 under UTC labels',
         inferred=True,broker_certified=False,spec=spec.__dict__,clock='broker_eu',risk=.000001,initial=10000000.))
     write_json(folder/'data_audit.json',audit)
@@ -38,7 +37,7 @@ def main():
             d=json.loads((path/'diagnostic.json').read_text())
         else:
             entry=trial(path,spec,settings,'broker_eu',first.isoformat(),end.isoformat(),
-                'DIAGNOSTIC_CLOCK',root/'reports/trials_ledger.csv',risk=.000001,
+                'DIAGNOSTIC_CLOCK',ledger,risk=.000001,
                 extra=dict(initial=10000000.,reason='closure-aligned inference, no profit selection'))
             log.info('START clock comparison %s',mode)
             try:
@@ -47,9 +46,9 @@ def main():
                     initial=10000000.,start=first,end=end,activity=activity,
                     candidate=lambda r:signals.get((r['ts'],r['pair'])))
                 d=describe(rep);write_run(path,rep,{m:'DIAGNOSTIC_INFERRED_CLOCK' for m in rep['months']})
-                write_json(path/'diagnostic.json',d);finish_trial(entry,root/'reports/trials_ledger.csv','COMPLETE')
+                write_json(path/'diagnostic.json',d);finish_trial(entry,ledger,'COMPLETE')
             except Exception:
-                finish_trial(entry,root/'reports/trials_ledger.csv','FAILED');raise
+                finish_trial(entry,ledger,'FAILED');raise
         rows.append(dict(clock='broker_eu',family=spec.family,mode=mode,**d))
     table(output/'clock_ablation',rows);log.info('CLOCK ABLATION COMPLETE')
 
