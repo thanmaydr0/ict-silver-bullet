@@ -79,10 +79,11 @@ def tape(frames,spec,minutes=1,stop_scale=1.):
             contiguous=previous is None or ts==previous+timedelta(minutes=1)
             if not contiguous:
                 bucket=[]; trs=[]; previous_close=None
-            prior_atr=mean(trs[-20:]) if len(trs)>=20 else None
-            tr=max(row['high']-row['low'],abs(row['high']-previous_close),abs(row['low']-previous_close)) if previous_close is not None else row['high']-row['low']
-            trs.append(tr)
-            if len(trs)>21: trs.pop(0)
+            prior_atr=sum(trs[-20:])/20 if minutes>1 and len(trs)>=20 else None
+            if minutes>1:
+                tr=max(row['high']-row['low'],abs(row['high']-previous_close),abs(row['low']-previous_close)) if previous_close is not None else row['high']-row['low']
+                trs.append(tr)
+                if len(trs)>21: trs.pop(0)
             previous_close=row['close']; previous=ts
             if minutes==1:
                 signal=model.update(row)
@@ -176,6 +177,7 @@ def event_stream(cache,signals,activity):
                 cursors[pair]=max(cursors[pair],k)
         cursors[symbol]=i+1;previous=(stamp,symbol)
         row={col:values[i] for col,values in cache[symbol]['columns'].items()}
+        row={col:value.item() if isinstance(value,np.generic) else value for col,value in row.items()}
         row['ts']=row['ts'].to_pydatetime()
         yield row
 
@@ -250,7 +252,14 @@ def main():
         source_code_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     if (output/'protocol.json').exists():
         previous=json.loads((output/'protocol.json').read_text())
-        if previous!=protocol: raise ValueError('diagnostic protocol changed; do not silently resume')
+        parameters=lambda p:{k:v for k,v in p.items() if k!='source_code_sha256'}
+        if parameters(previous)!=parameters(protocol):
+            raise ValueError('diagnostic protocol changed; do not silently resume')
+        if previous!=protocol:
+            revisions=output/'code_revisions.json'
+            history=json.loads(revisions.read_text()) if revisions.exists() else [previous]
+            history.append(protocol);write_json(revisions,history)
+            log.warning('Diagnostic implementation revision recorded in %s; parameters unchanged',revisions)
     write_json(output/'protocol.json',protocol)
 
     def execute(name,spec,signals,mode='full',policy='stop_first',charts=True,screening=False):

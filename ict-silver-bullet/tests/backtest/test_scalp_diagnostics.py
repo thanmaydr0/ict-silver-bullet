@@ -66,6 +66,8 @@ def test_sparse_null_stream_matches_full_existing_engine(tmp_path):
     assert full['trades']==sparse['trades']==compact['trades']==event['trades']
     assert full['final_balance']==sparse['final_balance']==compact['final_balance']
     assert not compact['open_position']
+    import json
+    json.dumps(event['trades'],allow_nan=False)
 
 
 def test_random_controls_are_reproducible_direction_independent():
