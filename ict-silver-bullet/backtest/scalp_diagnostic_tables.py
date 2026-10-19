@@ -18,7 +18,10 @@ def main():
     def number(row,key):
         return float(row[key]) if row.get(key) not in ('',None) else None
     def fmt(x):
-        return round(x,6) if isinstance(x,float) else x
+        if isinstance(x,float):
+            x=round(x,6)
+            return int(x) if x.is_integer() else x
+        return x
     def emit(name,rows):
         rows=[{k:fmt(v) for k,v in row.items()} for row in rows]
         table(output/name,rows);return rows
@@ -26,6 +29,10 @@ def main():
         combined=read('null_worker_0.csv')+read('null_worker_1.csv')
         if len(combined)!=1000 or len({(r['seed'],r['control']) for r in combined})!=1000:
             raise ValueError('worker null coverage is incomplete')
+        expected={(str(seed),label) for seed in range(200) for label in
+                  ('zero_R1.5','full_R1.5','zero_R2','full_R2','zero_symmetric')}
+        if {(r['seed'],r['control']) for r in combined}!=expected:
+            raise ValueError('unexpected null seed/control membership')
         table(output/'null_seeds',sorted(combined,key=lambda r:(int(r['seed']),r['control'])))
         ledger=root/'reports/trials_ledger.csv'
         with ledger.open(newline='',encoding='utf-8') as f:
@@ -33,11 +40,13 @@ def main():
         ids={r['trial_id'] for r in entries}
         paths=[output/f'null_worker_{i}_trials.csv' for i in (0,1)]
         paths.append(output/'clock_ablation/trials_ledger.csv')
+        paths.append(output/'null_parity_trials.csv')
         for path in paths:
             if not path.exists():continue
             with path.open(newline='',encoding='utf-8') as f:
                 for entry in csv.DictReader(f):
-                    if entry['status']!='COMPLETE':raise ValueError('unfinished auxiliary trial ledger')
+                    if entry['status'] not in ('COMPLETE','INTERRUPTED_MECHANICAL_RESTART'):
+                        raise ValueError('unfinished auxiliary trial ledger')
                     if entry['trial_id'] not in ids:
                         entries.append(entry);ids.add(entry['trial_id'])
         temp=ledger.with_suffix('.merge.tmp')
@@ -164,7 +173,7 @@ def main():
     if (output/'table_3_clock_closures.md').exists():
         text.extend(['## Source-clock diagnosis',(output/'table_3_clock_closures.md').read_text(),
             'Weekly closures strongly favor a UTC+2/+3 European-DST server-clock interpretation over the stored UTC label. This is closure-based inference, not broker certification or a selection using profits. Intended-session conclusions under the UTC label remain invalid until provenance is resolved.',
-            'MetaQuotes documents that chart history uses broker server time: https://www.mql5.com/en/book/common/timing/timing_local_server . A primary market-hours reference lists the Friday close near 17:00 New York: https://www.oanda.com/us-en/trading/hours-of-operation/ . Neither document alone proves the timezone of this export.'])
+            '[MetaQuotes documents](https://www.mql5.com/en/book/common/timing/timing_local_server) that chart history uses broker server time. [OANDA market hours](https://www.oanda.com/us-en/trading/hours-of-operation/) provide a primary reference for the Friday close near 17:00 New York. Neither document alone proves the timezone of this export.'])
     if (output/'clock_ablation.md').exists():
         text.extend(['## Frozen-logic clock sensitivity',(output/'clock_ablation.md').read_text(),
             'This additional comparison keeps the already frozen family and rules unchanged and changes only the closure-inferred source-clock interpretation. It does not select a timezone by its return, restore an independent holdout, or authorize integration.'])

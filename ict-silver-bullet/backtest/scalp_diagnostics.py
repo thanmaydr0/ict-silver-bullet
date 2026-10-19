@@ -226,7 +226,7 @@ def table(path,rows):
         w=csv.DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(rows)
     lines=['| '+' | '.join(fields)+' |','| '+' | '.join('---' for _ in fields)+' |']
     for row in rows:
-        lines.append('| '+' | '.join(str(row.get(k,'')) for k in fields)+' |')
+        lines.append('| '+' | '.join('—' if row.get(k,'') is None else str(row.get(k,'')) for k in fields)+' |')
     path.with_suffix('.md').write_text('\n'.join(lines)+'\n',encoding='utf-8')
 
 
