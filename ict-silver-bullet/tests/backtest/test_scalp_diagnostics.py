@@ -47,6 +47,18 @@ def test_opening_gap_stop_cannot_be_overridden_by_target_first():
     assert r['trades'][0]['reason']=='stop' and r['trades'][0]['r']<-1
 
 
+def test_known_open_target_precedes_a_later_stop_even_under_stop_first():
+    data=rows(4)
+    data[2].update(open=1.103,high=1.104,low=1.098,close=1.1)
+    spec=Specification('compression')
+    old=run(data,spec,candidate=one_signal,costs=DiagnosticCosts(mode='zero'),known_open_priority=False)
+    fixed=run(data,spec,candidate=one_signal,costs=DiagnosticCosts(mode='zero'))
+    assert old['trades'][0]['reason']=='stop'
+    assert fixed['trades'][0]['reason']=='target_at_open'
+    assert fixed['trades'][0]['gross']>0 and old['trades'][0]['gross']<0
+    assert fixed['reasons']['known_open_target_priority']==1
+
+
 def test_sparse_null_stream_matches_full_existing_engine(tmp_path):
     import pandas as pd
     data=rows(200)

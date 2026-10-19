@@ -45,7 +45,7 @@ def describe(report):
         return mean(t[key]/t['reference_r_usd'] for t in ts) if ts else None
     stops=mean(t['stop_distance_pips'] for t in ts) if ts else None
     cp=mean(t['costs']/(10*t['lots']) for t in ts) if ts else None
-    barrier=[t for t in ts if t['reason'] in ('stop','target','target_ambiguous')]
+    barrier=[t for t in ts if t['reason'] in ('stop','target','target_ambiguous','target_at_open')]
     return dict(trades=len(ts),gross_r=avg('gross'),net_r=avg('net'),cost_r=avg('costs'),
         fixed_spread_only_r=mean((t['gross']-t['spread_cost'])/t['reference_r_usd'] for t in ts) if ts else None,
         fixed_spread_commission_r=mean((t['gross']-t['spread_cost']-t['commission'])/t['reference_r_usd'] for t in ts) if ts else None,
@@ -57,6 +57,7 @@ def describe(report):
         ambiguous_share_pct=100*sum(t['ambiguous'] for t in ts)/len(ts) if ts else 0.,
         ambiguous_bars=report['reasons'].get('both_touched',0),
         opening_target_then_stop=report['reasons'].get('open_already_beyond_target_then_stop',0),
+        known_open_target_resolutions=report['reasons'].get('known_open_target_priority',0),
         accounting_max_error=max((abs(t['gross']-t['costs']-t['net']) for t in ts),default=0.),
         risk_flags_seen=';'.join(report['risk_flags_seen']),overall_halt=report['overall_halt'],
         open_position=report['open_position'])
@@ -276,7 +277,7 @@ def main():
             activity={}
             rep=run(event_stream(cached,signals,activity),spec,costs=settings,risk=risk,initial=initial,
                     start=first,end=end,candidate=lambda r:signals.get((r['ts'],r['pair'])),
-                    ambiguity=policy,retain_marks=charts,activity=activity)
+                    ambiguity=policy,retain_marks=charts,activity=activity,known_open_priority=False)
             if rep['open_position']: raise ValueError('position remains at end of real data')
             stat=describe(rep)
             if stat['accounting_max_error']>1e-6: raise ValueError('cash accounting identity failed')

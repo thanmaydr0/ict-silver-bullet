@@ -41,6 +41,7 @@ def main():
         paths=[output/f'null_worker_{i}_trials.csv' for i in (0,1)]
         paths.append(output/'clock_ablation/trials_ledger.csv')
         paths.append(output/'null_parity_trials.csv')
+        paths.append(output/'known_open_fix/trials_ledger.csv')
         for path in paths:
             if not path.exists():continue
             with path.open(newline='',encoding='utf-8') as f:
@@ -180,6 +181,9 @@ def main():
     if (output/'clock_resolution.md').exists():
         text.extend(['## Resolution under the closure-aligned clock',(output/'clock_resolution.md').read_text(),
             'Monthly tables/charts under clock_ablation/M5_zero, M5_full, M15_zero and M15_full use the same $10,000 screening account and M1 fills as the stored-label resolution comparison.'])
+    if (output/'known_open_fix.md').exists():
+        text.extend(['## Corrected known-opening-target priority',(output/'known_open_fix.md').read_text(),
+            'The legacy tables deliberately reproduce the old stop-first rule. The default engine now prioritizes a target already crossed at the known open over a later stop. Unknown intrabar ordering still uses stop-first. No favorable gap-price improvement is credited. Null controls are retained as legacy diagnostics rather than silently mixing engine versions.'])
     text.extend(['## 7. Attribution',
         'The tables above separate measured cost drag, gross expectancy, null-relative performance and ordering bias. The written verdict must distinguish a detectable statistical difference from an economically usable edge. No result can certify the intended New York sessions while source-clock mapping is unverified.',
         'Original-engine parity on an actual 96-trade historical prefix passed, as did 33 unit tests. Faster replay never substitutes another execution kernel: it skips flat/no-order intervals and processes every M1 bar while pending/open. No source prices were generated or interpolated.',

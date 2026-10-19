@@ -45,7 +45,8 @@ def main():
                     signals=random_tape(pool,seed,reward);activity={}
                     report=run(event_stream(cached,signals,activity),spec,costs=settings,
                         risk=.000001,initial=10000000.,start=first,end=end,activity=activity,
-                        retain_marks=False,retain_paths=False,candidate=lambda r:signals.get((r['ts'],r['pair'])))
+                        retain_marks=False,retain_paths=False,known_open_priority=False,
+                        candidate=lambda r:signals.get((r['ts'],r['pair'])))
                     stat=describe(report)
                     if stat['open_position'] or stat['accounting_max_error']>1e-6:
                         raise ValueError('null accounting or boundary check failed')

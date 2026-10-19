@@ -45,7 +45,7 @@ def main():
                 activity={}
                 rep=run(event_stream(cached,signals,activity),spec,costs=settings,risk=.000001,
                     initial=10000000.,start=first,end=end,activity=activity,
-                    candidate=lambda r:signals.get((r['ts'],r['pair'])))
+                    candidate=lambda r:signals.get((r['ts'],r['pair'])),known_open_priority=False)
                 d=describe(rep);write_run(path,rep,{m:'DIAGNOSTIC_INFERRED_CLOCK' for m in rep['months']})
                 write_json(path/'diagnostic.json',d);finish_trial(entry,ledger,'COMPLETE')
             except Exception:
@@ -72,7 +72,7 @@ def main():
                     activity={}
                     rep=run(event_stream(cached,signals,activity),spec,costs=settings,risk=.0005,
                         initial=10000.,start=first,end=end,activity=activity,
-                        candidate=lambda r:signals.get((r['ts'],r['pair'])))
+                        candidate=lambda r:signals.get((r['ts'],r['pair'])),known_open_priority=False)
                     d=describe(rep);write_run(path,rep,{m:'DIAGNOSTIC_INFERRED_CLOCK' for m in rep['months']})
                     write_json(path/'diagnostic.json',d);finish_trial(entry,ledger,'COMPLETE')
                 except Exception:

@@ -13,7 +13,8 @@ from brain.news.blackout import is_in_news_blackout
 
 def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
         end=None, news_events=(), news_complete=False, candidate=None,
-        ambiguity='stop_first', retain_marks=True, activity=None, retain_paths=True):
+        ambiguity='stop_first', retain_marks=True, activity=None, retain_paths=True,
+        known_open_priority=True):
     if ambiguity not in ('stop_first','target_first','open_direction'):
         raise ValueError('unknown intrabar ambiguity rule')
     costs = costs or Costs()
@@ -163,9 +164,17 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
             first_is_target = both and (opening-p['stop'])*p['sign']>0 and (ambiguity=='target_first' or (
                 ambiguity=='open_direction' and
                 ((row['close']<row['open']) == (p['sign']>0))))
+            known_target = known_open_priority and both and (opening-p['target'])*p['sign']>=0
+            first_is_target |= known_target
             exit_adverse = (min(opening,p['stop']) if p['sign'] > 0 else max(opening,p['stop'])) if stopped else adverse
             if first_is_target:
                 exit_adverse=opening
+            if known_target:
+                # An already crossed target precedes any later intrabar stop.
+                # Keep the conservative target fill; never create a peak from
+                # the better opening quote that this fill does not realize.
+                exit_adverse=p['target']
+                reasons['known_open_target_priority'] += 1
             if both and (opening-p['target'])*p['sign']>=0:
                 reasons['open_already_beyond_target_then_stop'] += 1
             def floating(quote):
@@ -175,7 +184,8 @@ def run(bars, spec, *, costs=None, risk=.0005, initial=10000., start=None,
             flags = sample(now, state.balance+p['entry_commission']+worst)
             if first_is_target:
                 p['maximum_pnl']=max(p['maximum_pnl'],floating(p['target']))
-                close(p['target']-extra,spread,decision_time,'target_ambiguous')
+                close(p['target']-extra,spread,decision_time,
+                      'target_at_open' if known_target else 'target_ambiguous')
             elif stopped:
                 close(exit_adverse-extra, spread, decision_time, 'stop')
             elif state.daily_halt or state.overall_halt:
